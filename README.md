@@ -173,6 +173,10 @@ except SandboxPending as still:
     print(still.pending_reason)  # still queued; call ready() again
 ```
 
+Running Cloud Hypervisor sandboxes support live CPU, memory, and root-disk updates
+through `tl sbx update` and every Sandbox SDK. Resource arguments match create,
+and updates wait for confirmed completion by default. See [sandbox resource resize](docs/sandbox-resize.md).
+
 ### Snapshots
 
 Save the state of a sandbox and restore it later:
@@ -277,6 +281,27 @@ await fork.writeFile("results/score.txt", "0.98");
 
 await fs.deleteSnapshot(snapshot.id);
 ```
+
+Choose storage placement when creating a filesystem in an enabled region. The API endpoint stays
+the same; uploads and read plans use the selected region's object store:
+
+```python
+from tensorlake.filesystem import FilesystemClient
+
+client = FilesystemClient(api_key="your-api-key")
+fs = client.create("frankfurt-artifacts", region="eu-central-1")
+```
+
+```ts
+const fs = await client.create("frankfurt-artifacts", { region: "eu-central-1" });
+```
+
+Rust callers use `artifact_storage.create_filesystem(project, name, Some("eu-central-1"))`.
+Omitting `region` keeps the legacy location. Placement is fixed for the filesystem's storage
+network: forks inherit it, and changes to a project's region do not move existing files.
+An unsupported region is rejected; the SDK never silently substitutes another region.
+The compatibility `create_file_system(..., region="eu-central-1")` and
+`createFileSystem(name, description, { region: "eu-central-1" })` helpers accept the same choice.
 
 `writeFile()` and `writeFiles()` accept bytes already in memory. Prefer `writeFileFromPath()` or
 `writeFilesFromPaths()` for large local files so neither JavaScript nor Rust retains the complete

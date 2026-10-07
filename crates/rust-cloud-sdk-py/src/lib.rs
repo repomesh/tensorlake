@@ -10,6 +10,7 @@ use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
+use tensorlake::sandboxes::resize::ResizeOptions;
 
 use futures::StreamExt;
 use pyo3::create_exception;
@@ -520,11 +521,18 @@ impl CloudApiClient {
     /// Returns JSON `{"trace_id", "default_branch"}` — the effective default
     /// branch differs from "main" only when a lost-response retry adopted a
     /// pre-existing filesystem.
-    fn create_filesystem(&self, project_id: String, name: String) -> PyResult<String> {
+    #[pyo3(signature = (project_id, name, region=None))]
+    fn create_filesystem(
+        &self,
+        project_id: String,
+        name: String,
+        region: Option<String>,
+    ) -> PyResult<String> {
         let maybe_executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.run_artifact_with_retry(5, move |client| {
             let project_id = project_id.clone();
             let name = name.clone();
+            let region = region.clone();
             let maybe_executed = maybe_executed.clone();
             async move {
                 // Minted before the forgiveness-tracked call: a mint failure
@@ -532,11 +540,10 @@ impl CloudApiClient {
                 // it must never arm the 409 forgiveness below.
                 let credential = client.git_credential_for_project(&project_id).await?;
                 match client
-                    .create_repo_with_credential(
+                    .create_filesystem_with_credential(
                         &project_id,
                         &name,
-                        Some("main"),
-                        Some(REPO_KIND_FILESYSTEM),
+                        region.as_deref(),
                         &credential.git_username,
                         &credential.token,
                     )
@@ -569,7 +576,7 @@ impl CloudApiClient {
                                 &credential.token,
                             )
                             .await?;
-                        if meta.is_filesystem() {
+                        if meta.matches_filesystem_region(region.as_deref()) {
                             // Report the adopted filesystem's real default
                             // branch so the SDK handle never assumes "main".
                             serde_json::to_string(&serde_json::json!({
@@ -579,7 +586,7 @@ impl CloudApiClient {
                             .map_err(SdkError::from)
                         } else {
                             Err(SdkError::ClientError(format!(
-                                "a non-filesystem repo named {name} already exists"
+                                "an existing repo named {name} does not match the requested filesystem kind and region"
                             )))
                         }
                     }
@@ -1695,22 +1702,69 @@ impl CloudSandboxClient {
         })
     }
 
+    #[pyo3(signature = (sandbox_id, request_json, wait=true, timeout_sec=300.0, poll_interval_sec=1.0))]
     fn update_sandbox(
         &self,
         sandbox_id: String,
         request_json: String,
+        wait: bool,
+        timeout_sec: f64,
+        poll_interval_sec: f64,
     ) -> PyResult<(String, String)> {
         let request: UpdateSandboxRequest = parse_json_payload(&request_json)?;
-        self.run_with_retry(5, move |client| {
-            let sandbox_id = sandbox_id.clone();
-            let request = request.clone();
-            async move {
-                let traced = client.update(&sandbox_id, &request).await?;
-                let trace_id = traced.trace_id.clone();
-                let json = serde_json::to_string(&*traced).map_err(SdkError::from)?;
-                Ok((trace_id, json))
-            }
-        })
+        let options = ResizeOptions {
+            wait,
+            timeout: duration_from_non_negative_seconds("timeout_sec", timeout_sec)?,
+            poll_interval: duration_from_seconds("poll_interval_sec", poll_interval_sec)?,
+        };
+        let policy = if request.resources.is_some() {
+            RetryPolicy::non_idempotent()
+        } else {
+            RetryPolicy::idempotent(5)
+        };
+        run_bounded_blocking(
+            self.client.clone(),
+            policy,
+            "sandbox update",
+            into_sandbox_py_error,
+            move |client| {
+                let sandbox_id = sandbox_id.clone();
+                let request = request.clone();
+                async move {
+                    let traced = client
+                        .update_with_options(&sandbox_id, &request, options)
+                        .await?;
+                    Ok((traced.trace_id.clone(), serde_json::to_string(&*traced)?))
+                }
+            },
+        )
+    }
+
+    #[pyo3(signature = (sandbox_id, generation, timeout_sec=300.0, poll_interval_sec=1.0))]
+    fn wait_for_resource_resize(
+        &self,
+        sandbox_id: String,
+        generation: u64,
+        timeout_sec: f64,
+        poll_interval_sec: f64,
+    ) -> PyResult<(String, String)> {
+        let timeout = duration_from_non_negative_seconds("timeout_sec", timeout_sec)?;
+        let poll = duration_from_seconds("poll_interval_sec", poll_interval_sec)?;
+        run_bounded_blocking(
+            self.client.clone(),
+            RetryPolicy::non_idempotent(),
+            "sandbox resize wait",
+            into_sandbox_py_error,
+            move |client| {
+                let id = sandbox_id.clone();
+                async move {
+                    let traced = client
+                        .wait_for_resource_resize(&id, generation, timeout, poll)
+                        .await?;
+                    Ok((traced.trace_id.clone(), serde_json::to_string(&*traced)?))
+                }
+            },
+        )
     }
 
     fn delete_sandbox(&self, sandbox_id: String) -> PyResult<String> {
@@ -2129,25 +2183,65 @@ impl CloudSandboxClient {
         })
     }
 
+    #[pyo3(signature = (sandbox_id, request_json, wait=true, timeout_sec=300.0, poll_interval_sec=1.0))]
     fn update_sandbox_async<'py>(
         &self,
         py: Python<'py>,
         sandbox_id: String,
         request_json: String,
+        wait: bool,
+        timeout_sec: f64,
+        poll_interval_sec: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request: UpdateSandboxRequest = parse_json_payload(&request_json)?;
+        let options = ResizeOptions {
+            wait,
+            timeout: duration_from_non_negative_seconds("timeout_sec", timeout_sec)?,
+            poll_interval: duration_from_seconds("poll_interval_sec", poll_interval_sec)?,
+        };
         let client = self.client.clone();
         future_into_py(py, async move {
-            let traced = retry_async_op(client, 5, move |c| {
-                let sandbox_id = sandbox_id.clone();
-                let request = request.clone();
-                async move { c.update(&sandbox_id, &request).await }
-            })
-            .await
+            let traced = if request.resources.is_some() {
+                client
+                    .update_with_options(&sandbox_id, &request, options)
+                    .await
+            } else {
+                retry_async_op(client, 5, move |c| {
+                    let id = sandbox_id.clone();
+                    let request = request.clone();
+                    async move { c.update(&id, &request).await }
+                })
+                .await
+            }
             .map_err(into_sandbox_py_error)?;
-            let trace_id = traced.trace_id.clone();
-            let json = serde_json::to_string(&*traced).map_err(sandbox_serde_err)?;
-            Ok((trace_id, json))
+            Ok((
+                traced.trace_id.clone(),
+                serde_json::to_string(&*traced).map_err(sandbox_serde_err)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (sandbox_id, generation, timeout_sec=300.0, poll_interval_sec=1.0))]
+    fn wait_for_resource_resize_async<'py>(
+        &self,
+        py: Python<'py>,
+        sandbox_id: String,
+        generation: u64,
+        timeout_sec: f64,
+        poll_interval_sec: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = duration_from_non_negative_seconds("timeout_sec", timeout_sec)?;
+        let poll = duration_from_seconds("poll_interval_sec", poll_interval_sec)?;
+        let client = self.client.clone();
+        future_into_py(py, async move {
+            let traced = client
+                .wait_for_resource_resize(&sandbox_id, generation, timeout, poll)
+                .await
+                .map_err(into_sandbox_py_error)?;
+            Ok((
+                traced.trace_id.clone(),
+                serde_json::to_string(&*traced).map_err(sandbox_serde_err)?,
+            ))
         })
     }
 
@@ -3768,7 +3862,13 @@ fn duration_from_seconds(name: &str, seconds: f64) -> PyResult<Duration> {
             format!("{name} must be a positive finite number"),
         )));
     }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        CloudSandboxClientError::new_err((
+            "sdk_usage",
+            Option::<u16>::None,
+            format!("{name} is outside the supported duration range"),
+        ))
+    })
 }
 
 /// Like [`duration_from_seconds`] but accepts zero: a zero wait budget is a
@@ -3781,7 +3881,13 @@ fn duration_from_non_negative_seconds(name: &str, seconds: f64) -> PyResult<Dura
             format!("{name} must be a non-negative finite number"),
         )));
     }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        CloudSandboxClientError::new_err((
+            "sdk_usage",
+            Option::<u16>::None,
+            format!("{name} is outside the supported duration range"),
+        ))
+    })
 }
 
 /// Replay `op` only while its failures provably never reached the server —
@@ -3821,6 +3927,11 @@ fn into_py_error(error: SdkError) -> PyErr {
 
 fn into_sandbox_py_error(error: SdkError) -> PyErr {
     match error {
+        SdkError::SandboxResize(error) => CloudSandboxClientError::new_err((
+            "resize",
+            Option::<u16>::None,
+            serde_json::to_string(&error).expect("serializable resize error"),
+        )),
         SdkError::Authentication(message) => {
             CloudSandboxClientError::new_err(("sdk_usage", Some(401u16), message))
         }
