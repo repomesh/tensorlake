@@ -23,7 +23,7 @@ In addition to stateful VMs, you can also add long running orchestration capabil
 
 ## Sandboxes
 
-Tensorlake Sandboxes are stateful Firecracker MicroVMs built for instant, stateful execution environments for AI agents — spin up millions of VMs with near-SSD filesystem performance.
+Tensorlake Sandboxes provide instant, stateful execution environments for AI agents — spin up millions of sandboxes with near-SSD filesystem performance.
 
 ### Key capabilities
 * **Fastest Filesystem I/O** — Block-based storage achieving near-SSD speeds inside virtual machines. In SQLite benchmarks (2 vCPUs, 4 GB RAM), Tensorlake completes in **2.45s** vs Vercel 3.00s (1.2×), E2B 3.92s (1.6×), Modal 4.66s (1.9×), and Daytona 5.51s (2.2×).
@@ -173,9 +173,12 @@ except SandboxPending as still:
     print(still.pending_reason)  # still queued; call ready() again
 ```
 
-Running Cloud Hypervisor sandboxes support live CPU, memory, and root-disk updates
-through `tl sbx update` and every Sandbox SDK. Resource arguments match create,
-and updates wait for confirmed completion by default. See [sandbox resource resize](docs/sandbox-resize.md).
+Running CPU-only CAS sandboxes support live CPU, memory, and root-disk updates
+through `tl sbx update` and every Sandbox SDK. Running GPU CAS sandboxes support
+root-disk growth; CPU and memory changes are rejected. Non-CAS sandboxes do not
+support live resize. Resource arguments match create, and updates wait for
+confirmed completion by default.
+See [sandbox resource resize](docs/sandbox-resize.md).
 
 ### Snapshots
 
@@ -226,6 +229,31 @@ sandbox = client.connect("stable-name")
 
 Pool root disks default to the registered image's size. Pass `disk_mb` to grow
 a filesystem-only image; a pool disk cannot be smaller than its image.
+
+GPU CAS pools allocate GPUs per container. Use a CAS image and pass `gpus=1`
+with `gpu_model="A10"` (or `gpu=GpuRequest(count=1, model=GpuModel.A10)`) to
+`create_pool` and `update_pool`. The asynchronous Python API accepts the same
+arguments; TypeScript uses `gpus`, `gpuModel`, or `gpu` in its pool options.
+Passing only `gpu_model` / `gpuModel` allocates one GPU per container for
+both standalone sandbox creation and pool APIs, matching `tl sbx create --gpu`.
+Claimed sandboxes inherit the pool's GPU allocation. Include that allocation
+on each pool update; omitting it configures a CPU-only CAS pool. Changing the
+allocation recycles unclaimed warm containers while claimed sandboxes keep
+their original allocation. Set `max_containers=1` and `warm_containers=1` for
+a single-GPU pool; it can replenish warm capacity after the claim releases
+its GPU.
+
+Pool responses expose the allocation as `pool.resources.gpu_configs` in
+Python and Rust, and `pool.resources.gpuConfigs` in TypeScript.
+Python response allocations use `GpuAllocation`, whose `model` preserves the
+server's exact identifier, such as `H100-PCIe-80GB`. Typed requests use
+`GpuRequest` with a supported `GpuModel`. When updating a pool, pass the
+reported count and the corresponding supported request model.
+
+Inspect a claimed sandbox's GPU allocation with `tl sbx describe <sandbox-id>`
+or the `GPUs` column in `tl sbx ls`. Both show count and model, such as
+`2 x H100`; sandboxes without a GPU allocation show `-`. Archived sandboxes
+show the same information with `tl sbx ls --archived`.
 
 Set the pool network policy when you create the pool, replace it later with a
 pool update, or pass `CLEAR_NETWORK_POLICY` (Python) / `null` (TypeScript) to
@@ -430,7 +458,7 @@ curl https://api.tensorlake.ai/applications/city_guide_app \
 Tensorlake is the sandbox-native cloud for AI agents — a compute platform for securely running untrusted, LLM-generated code in isolated sandboxes and orchestrating agentic applications at scale.
 
 **How do I run untrusted or LLM-generated code safely?**
-Each Tensorlake sandbox is an isolated Firecracker MicroVM, so untrusted or LLM-generated code runs in a hardware-virtualized environment separate from your infrastructure and other sandboxes. Create one with the Python or TypeScript SDK, or the CLI, in a few lines.
+Each Tensorlake sandbox provides an isolated environment for running untrusted or LLM-generated code. Create a CPU-only CAS or GPU CAS sandbox with the Python or TypeScript SDK, or the CLI, in a few lines.
 
 **How is Tensorlake different from E2B, Modal, or Daytona?**
 Tensorlake is built for heavy filesystem I/O, fast startup, and large-scale fan-out. In SQLite benchmarks (2 vCPUs, 4 GB RAM) it completes in 2.45s versus E2B (3.92s), Modal (4.66s), and Daytona (5.51s), and it supports snapshots, auto suspend/resume, live migration, and up to 5 million sandboxes per project.

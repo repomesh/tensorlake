@@ -112,6 +112,10 @@ pub struct ContainerResourcesInfo {
     pub cpus: f64,
     pub memory_mb: i64,
     pub disk_mb: i64,
+    /// GPU allocation reported by the service. Include it in pool updates to
+    /// retain the allocation when replacing the pool configuration.
+    #[serde(default, alias = "gpus", skip_serializing_if = "Option::is_none")]
+    pub gpu_configs: Option<Vec<GPUResources>>,
 }
 
 /// GPU models supported by the sandbox scheduler.
@@ -230,7 +234,7 @@ pub struct CreateSandboxResources {
     pub memory_mb: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_mb: Option<u64>,
-    /// GPU allocation. The server accepts GPU sandboxes only with a CAS
+    /// GPU allocation. The server accepts GPU CAS sandboxes only with a CAS
     /// (`content_addressed_streaming_v1`) image; omitting `image` asks the
     /// server to select its configured GPU default.
     #[serde(rename = "gpus", skip_serializing_if = "Option::is_none")]
@@ -387,8 +391,10 @@ pub struct DetachFileSystemRequest {
     pub mount_path: String,
 }
 
-/// Resource targets for a running Cloud Hypervisor sandbox. Names and numeric
-/// types match create; values are optional to support partial updates.
+/// Resource targets for a running sandbox. CPU-only CAS sandboxes support CPU,
+/// memory, and root-disk resize; GPU CAS sandboxes support only root-disk growth.
+/// Non-CAS sandboxes do not support live resize.
+/// Names and numeric types match create; values are optional for partial updates.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResizeSandboxResources {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,6 +439,9 @@ pub struct UpdateSandboxRequest {
 pub struct SandboxPoolRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Per-container allocation, including GPUs for a GPU CAS pool. Pool
+    /// updates replace this allocation; include GPUs on each update to keep
+    /// the pool GPU-enabled. Claims inherit these resources.
     pub resources: CreateSandboxResources,
     #[serde(default)]
     pub timeout_secs: i64,
@@ -1090,7 +1099,28 @@ pub enum RunProcessEvent {
         signal: Option<i64>,
         #[serde(default)]
         oom_killed: bool,
+        /// Why the process ended. Absent from daemons older than this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<ProcessExitReason>,
     },
+}
+
+/// Why a process run to completion ended, as reported by the sandbox daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessExitReason {
+    /// The process exited on its own; `exit_code` holds its status.
+    Exited,
+    /// The process was killed by a signal; `signal` holds its number.
+    Signaled,
+    /// The kernel OOM killer terminated the process.
+    OomKilled,
+    /// The run's `timeout` expired and the daemon killed the process.
+    TimedOut,
+    /// A reason this SDK version does not know. `exit_code` and `signal`
+    /// still describe how the process ended.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1229,6 +1259,36 @@ mod tests {
             serde_json::to_value(&policy).unwrap()
         );
         assert!(out.get("network").is_none());
+    }
+
+    #[test]
+    fn container_resources_info_retains_gpu_allocations() {
+        let allocation = serde_json::json!([{"count": 2, "model": "H100"}]);
+        for field in ["gpu_configs", "gpus"] {
+            let mut wire = serde_json::json!({"cpus": 2.0, "memory_mb": 4096, "disk_mb": 20480});
+            wire[field] = allocation.clone();
+            let resources: ContainerResourcesInfo = serde_json::from_value(wire).unwrap();
+            assert_eq!(
+                resources.gpu_configs,
+                Some(vec![
+                    GpuRequest {
+                        count: 2,
+                        model: GpuModel::H100
+                    }
+                    .into()
+                ])
+            );
+            let serialized = serde_json::to_value(&resources).unwrap();
+            assert_eq!(serialized["gpu_configs"], allocation);
+            assert!(serialized.get("gpus").is_none());
+        }
+        for allocation in [serde_json::Value::Null, serde_json::json!([])] {
+            let resources: ContainerResourcesInfo = serde_json::from_value(serde_json::json!({
+                "cpus": 1.0, "memory_mb": 1024, "disk_mb": 20480, "gpu_configs": allocation
+            }))
+            .unwrap();
+            assert!(resources.gpu_configs.as_ref().is_none_or(Vec::is_empty));
+        }
     }
 
     #[test]
@@ -1472,6 +1532,7 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 oom_killed: false,
+                reason: None,
             }
         ));
     }
@@ -1486,6 +1547,7 @@ mod tests {
                 exit_code: None,
                 signal: Some(9),
                 oom_killed: false,
+                reason: None,
             }
         ));
     }
@@ -1500,8 +1562,49 @@ mod tests {
                 exit_code: None,
                 signal: Some(9),
                 oom_killed: true,
+                reason: None,
             }
         ));
+    }
+
+    #[test]
+    fn run_process_event_deserializes_timed_out_reason() {
+        let json = r#"{"signal": 9, "reason": "timed_out"}"#;
+        let event: RunProcessEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            RunProcessEvent::Exited {
+                exit_code: None,
+                signal: Some(9),
+                oom_killed: false,
+                reason: Some(ProcessExitReason::TimedOut),
+            }
+        ));
+        // The reason survives re-encoding: the Python and TypeScript SDKs
+        // read the events this crate serializes.
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["reason"], "timed_out");
+    }
+
+    #[test]
+    fn run_process_event_tolerates_unknown_reason() {
+        let json = r#"{"signal": 9, "reason": "some_future_reason"}"#;
+        let event: RunProcessEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            RunProcessEvent::Exited {
+                signal: Some(9),
+                reason: Some(ProcessExitReason::Unknown),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn run_process_event_omits_absent_reason() {
+        let event: RunProcessEvent = serde_json::from_str(r#"{"exit_code": 0}"#).unwrap();
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert!(encoded.get("reason").is_none());
     }
 
     #[test]

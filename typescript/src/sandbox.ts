@@ -20,6 +20,7 @@ import {
 } from "./native-sandbox.js";
 import {
   type CheckpointOptions,
+  CommandExitReason,
   type CommandResult,
   type ConnectOptions,
   type CopySandboxOptions,
@@ -956,6 +957,9 @@ export class Sandbox {
    *
    * Resource targets use create's cpus, memoryMb, and diskMb names. Resize
    * waits by default; wait=false returns admission. Timeout does not cancel it.
+   * CPU-only CAS sandboxes support CPU, memory, and root-disk resize; GPU CAS sandboxes
+   * support only root-disk growth and reject CPU and memory changes.
+   * Non-CAS sandboxes do not support live resize.
    * Wait, timeout, and pollInterval are ignored on non-resource updates.
    * A no-op returns current resources with absent or earlier resize metadata.
    *
@@ -1219,16 +1223,18 @@ export class Sandbox {
       () => proxy.runProcess(JSON.stringify(body)),
       { sandboxId: this.sandboxId },
     );
-    const { exitCode, stdout, stderr } = assembleCommandResult(events);
+    const { exitCode, stdout, stderr, reason } = assembleCommandResult(events);
     logSdkTiming("sandbox.run", "complete", opStart, {
       sandbox_id: this.sandboxId,
       server_trace_id: traceId,
       command: sdkTimingPayloadsEnabled() ? command : undefined,
       command_length: command.length,
       exit_code: exitCode,
+      exit_reason: reason,
     });
 
-    return Object.assign({ exitCode, stdout, stderr }, { traceId });
+    const timedOut = reason === CommandExitReason.TIMED_OUT;
+    return Object.assign({ exitCode, stdout, stderr, reason, timedOut }, { traceId });
   }
 
   // --- Process management ---

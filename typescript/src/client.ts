@@ -115,7 +115,10 @@ function gpuRequest(
     gpus = gpu.count;
     gpuModel = gpu.model;
   }
-  if (gpus == null) return undefined;
+  if (gpus == null) {
+    if (gpuModel == null) return undefined;
+    gpus = 1;
+  }
   if (!Number.isInteger(gpus) || gpus < 1) {
     throw new SandboxError("gpus must be a positive integer");
   }
@@ -626,7 +629,9 @@ export class SandboxClient {
   }
 
   /**
-   * Update properties or resize a Running Cloud Hypervisor sandbox.
+   * Update properties or resize a running sandbox. CPU-only CAS sandboxes support
+   * CPU, memory, and root-disk resize; GPU CAS sandboxes support only root-disk
+   * growth. Non-CAS sandboxes do not support live resize.
    * Resource names match create. Resize waits by default; wait=false returns
    * admission. Timeout leaves the resize running and reports its generation.
    * Wait, timeout, and pollInterval are ignored on non-resource updates.
@@ -1036,12 +1041,14 @@ export class SandboxClient {
   async createPool(
     options: CreatePoolOptions,
   ): Promise<CreateSandboxPoolResponse> {
+    const gpus = gpuRequest(options.gpu, options.gpus, options.gpuModel);
     const body: Record<string, unknown> = {
       image: options.image,
       resources: {
         cpus: options.cpus ?? 1.0,
         memory_mb: options.memoryMb ?? 1024,
         ...(options.diskMb != null ? { disk_mb: options.diskMb } : {}),
+        ...(gpus != null ? { gpus } : {}),
       },
       timeout_secs: options.timeoutSecs ?? 0,
     };
@@ -1083,21 +1090,23 @@ export class SandboxClient {
    * network policy, set it to replace the policy, or pass `null` to remove the
    * policy entirely. On a change the service recycles the pool's unclaimed
    * warm containers onto the new policy, while containers already claimed by
-   * sandboxes keep the policy they booted with. CPU, memory, disk, image, and
-   * entrypoint changes likewise recycle unclaimed warm containers
-   * asynchronously. If suitable capacity is unavailable, stale warm
+   * sandboxes keep the policy they booted with. CPU, memory, disk, GPU
+   * allocation, image, and entrypoint changes likewise recycle unclaimed warm
+   * containers asynchronously. If suitable capacity is unavailable, stale warm
    * containers are not used as a fallback.
    */
   async updatePool(
     poolId: string,
     options: UpdatePoolOptions,
   ): Promise<SandboxPoolInfo> {
+    const gpus = gpuRequest(options.gpu, options.gpus, options.gpuModel);
     const body: Record<string, unknown> = {
       image: options.image,
       resources: {
         cpus: options.cpus ?? 1.0,
         memory_mb: options.memoryMb ?? 1024,
         ...(options.diskMb != null ? { disk_mb: options.diskMb } : {}),
+        ...(gpus != null ? { gpus } : {}),
       },
       timeout_secs: options.timeoutSecs ?? 0,
     };

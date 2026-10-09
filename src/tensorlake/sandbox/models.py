@@ -169,7 +169,8 @@ class SnapshotType(str, Enum):
     - ``FILESYSTEM``: Capture filesystem state only. Sandboxes restored
       from this snapshot cold-boot from the snapshot tarball instead of
       warm-restoring VM state. Use this for sandbox image builds so that
-      the restored sandbox bypasses Firecracker's overlay-path constraints.
+      the restored sandbox bypasses the overlay-path constraints of non-CAS
+      sandboxes.
     """
 
     MEMORY = "memory"
@@ -188,14 +189,6 @@ class CheckpointType(str, Enum):
 
     MEMORY = "memory"
     FILESYSTEM = "filesystem"
-
-
-class ContainerResourcesInfo(BaseModel):
-    """Container resource configuration."""
-
-    cpus: float
-    memory_mb: int
-    disk_mb: int
 
 
 class GpuModel(str, Enum):
@@ -220,6 +213,24 @@ class GpuRequest(BaseModel):
 
 # Preserve the public name used by request/response models in older releases.
 GPUResources = GpuRequest
+
+
+class GpuAllocation(BaseModel):
+    """A reported GPU allocation, preserving the server's exact model identifier."""
+
+    count: int
+    model: str
+
+
+class ContainerResourcesInfo(BaseModel):
+    """Container resource configuration, including its GPU allocation."""
+
+    cpus: float
+    memory_mb: int
+    disk_mb: int
+    gpu_configs: list[GpuAllocation] | None = Field(
+        default=None, validation_alias=AliasChoices("gpu_configs", "gpus")
+    )
 
 
 class CreateSandboxResources(BaseModel):
@@ -1140,9 +1151,32 @@ class ListDirectoryResponse(BaseModel):
     entries: list[DirectoryEntry]
 
 
+class CommandExitReason(str, Enum):
+    """Why a command run with ``Sandbox.run`` ended."""
+
+    EXITED = "exited"
+    """The process exited on its own; ``exit_code`` is its exit status."""
+    SIGNALED = "signaled"
+    """The process was killed by a signal; ``exit_code`` is ``-signal``."""
+    OOM_KILLED = "oom_killed"
+    """The kernel OOM killer terminated the process (``exit_code`` is ``-9``)."""
+    TIMED_OUT = "timed_out"
+    """The run's ``timeout`` expired and the sandbox killed the process
+    (``exit_code`` is ``-9``)."""
+
+
 class CommandResult(BaseModel):
     """Result of running a command to completion."""
 
     exit_code: int
     stdout: str
     stderr: str
+    reason: CommandExitReason | None = None
+    """Why the command ended. ``Sandbox.run`` always sets it; sandboxes that
+    predate timeout reporting never report ``TIMED_OUT``, so a timed-out run
+    on them shows as ``SIGNALED``."""
+
+    @property
+    def timed_out(self) -> bool:
+        """True when the run's ``timeout`` expired and the process was killed."""
+        return self.reason == CommandExitReason.TIMED_OUT

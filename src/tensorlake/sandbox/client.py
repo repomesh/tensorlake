@@ -194,10 +194,12 @@ def _build_gpu_resources(
             raise SandboxError("gpu cannot be combined with gpus or gpu_model")
         return [gpu]
     if gpus is None:
-        return None
+        if gpu_model is None:
+            return None
+        gpus = 1
     if isinstance(gpus, bool) or not isinstance(gpus, int) or gpus < 1:
         raise SandboxError("gpus must be a positive integer")
-    gpu_model = gpu_model or "A10"
+    gpu_model = "A10" if gpu_model is None else gpu_model
     try:
         model = GpuModel(gpu_model)
     except ValueError:
@@ -613,10 +615,11 @@ class SandboxClient:
             disk_mb: Root disk size in MiB. When omitted, the server
                 uses its default disk size.
             gpus: Number of GPUs to allocate. When provided, defaults to
-                ``A10`` unless ``gpu_model`` is set. GPU sandboxes require a
+                ``A10`` unless ``gpu_model`` is set. GPU CAS sandboxes require a
                 CAS image; when ``image`` is omitted, the server selects its
                 configured GPU default.
             gpu_model: GPU model to allocate. Accepts any :class:`GpuModel` value.
+                Defaults to one GPU when ``gpus`` is omitted.
             gpu: Typed GPU model and count request. Cannot be combined with
                 ``gpus`` or ``gpu_model``.
             timeout_secs: Timeout in seconds (optional)
@@ -1076,9 +1079,12 @@ class SandboxClient:
     ) -> Traced[SandboxInfo]:
         """Update a running sandbox's properties.
 
-        Resource names and units match create. Resize requires a running Cloud
-        Hypervisor sandbox and cannot be mixed with name, proxy, or network
-        changes. Omitted dimensions retain their confirmed allocation.
+        Resource names and units match create. CPU-only CAS sandboxes support CPU,
+        memory, and root-disk resize. GPU CAS sandboxes support only root-disk growth
+        and reject CPU and memory changes. Non-CAS sandboxes do not support live
+        resize. Resize requires a running sandbox and cannot be mixed with name,
+        proxy, or network changes. Omitted dimensions retain their confirmed
+        allocation.
         Integer-valued floats such as 2048.0 are accepted for memory and disk;
         fractional values and booleans are rejected without rounding.
 
@@ -1699,6 +1705,9 @@ class SandboxClient:
         max_containers: int | None = None,
         warm_containers: int | None = None,
         network: NetworkConfig | ClearNetworkPolicy | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        gpu: GpuRequest | None = None,
     ) -> Traced[CreateSandboxPoolResponse]:
         """Create a new sandbox pool.
 
@@ -1714,6 +1723,11 @@ class SandboxClient:
             max_containers: Maximum number of containers in pool
             warm_containers: Number of warm containers to maintain
             network: Network policy for each container in the pool
+            gpus: GPUs per container, using A10 unless ``gpu_model`` is set.
+                GPU CAS pools require a CAS image.
+            gpu_model: GPU model to allocate for each container. Defaults to
+                one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU allocation, exclusive with ``gpus``/``gpu_model``.
 
         Returns:
             CreateSandboxPoolResponse with pool_id and namespace
@@ -1731,7 +1745,10 @@ class SandboxClient:
         request_model = SandboxPoolRequest(
             image=image,
             resources=CreateSandboxResources(
-                cpus=cpus, memory_mb=memory_mb, disk_mb=disk_mb
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=_build_gpu_resources(gpus, gpu_model, gpu),
             ),
             timeout_secs=timeout_secs,
             entrypoint=entrypoint,
@@ -1801,6 +1818,9 @@ class SandboxClient:
         max_containers: int | None = None,
         warm_containers: int | None = None,
         network: NetworkConfig | ClearNetworkPolicy | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        gpu: GpuRequest | None = None,
     ) -> Traced[SandboxPoolInfo]:
         """Update a sandbox pool configuration.
 
@@ -1809,10 +1829,10 @@ class SandboxClient:
         policy entirely. On a change the service recycles the pool's unclaimed
         warm containers onto the new policy, while containers already claimed
         by sandboxes keep the policy they booted with. Changes to CPU, memory,
-        disk, image, or entrypoint likewise recycle unclaimed warm containers
-        asynchronously. If suitable capacity is unavailable, the pool remains
-        below its warm target until capacity appears; stale warm containers are
-        never used as a fallback.
+        disk, GPU allocation, image, or entrypoint likewise recycle unclaimed
+        warm containers asynchronously. If suitable capacity is unavailable,
+        the pool remains below its warm target until capacity appears; stale
+        warm containers are never used as a fallback.
 
         Args:
             pool_id: ID of the pool to update
@@ -1829,6 +1849,12 @@ class SandboxClient:
             network: Replacement network policy for each container in the
                 pool. Omit to keep the current policy, or pass
                 ``CLEAR_NETWORK_POLICY`` to remove it.
+            gpus: GPUs per container, using A10 unless ``gpu_model`` is set.
+                Include the GPU allocation on each update to keep a GPU CAS
+                pool; omitting it configures a CPU-only CAS pool.
+            gpu_model: GPU model to allocate for each container. Defaults to
+                one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU allocation, exclusive with ``gpus``/``gpu_model``.
 
         Returns:
             SandboxPoolInfo with updated pool details
@@ -1841,7 +1867,10 @@ class SandboxClient:
         request_model = SandboxPoolRequest(
             image=image,
             resources=CreateSandboxResources(
-                cpus=cpus, memory_mb=memory_mb, disk_mb=disk_mb
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=_build_gpu_resources(gpus, gpu_model, gpu),
             ),
             timeout_secs=timeout_secs,
             entrypoint=entrypoint,
@@ -2059,10 +2088,11 @@ class SandboxClient:
             disk_mb: Root disk size in MiB. When omitted, the server
                 uses its default disk size.
             gpus: Number of GPUs to allocate. When provided, defaults to
-                ``A10`` unless ``gpu_model`` is set. GPU sandboxes require a
+                ``A10`` unless ``gpu_model`` is set. GPU CAS sandboxes require a
                 CAS image; when ``image`` is omitted, the server selects its
                 configured GPU default.
             gpu_model: GPU model to allocate. Accepts any :class:`GpuModel` value.
+                Defaults to one GPU when ``gpus`` is omitted.
             gpu: Typed GPU model and count request. Cannot be combined with
                 ``gpus`` or ``gpu_model``.
             timeout_secs: Timeout in seconds (optional)

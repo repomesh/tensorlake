@@ -29,6 +29,7 @@ from .models import (
     AsyncPendingSandbox,
     CheckpointType,
     ClearNetworkPolicy,
+    CommandExitReason,
     CommandResult,
     ContainerResourcesInfo,
     CopiedSandboxResponse,
@@ -41,6 +42,7 @@ from .models import (
     FileSystem,
     FileSystemMount,
     GetOrCreateOutcome,
+    GpuAllocation,
     GpuModel,
     GpuRequest,
     GPUResources,
@@ -127,6 +129,7 @@ __all__ = [
     "CreateSandboxPoolResponse",
     "ContainerResourcesInfo",
     "GPUResources",
+    "GpuAllocation",
     "GpuModel",
     "GpuRequest",
     "CLEAR_NETWORK_POLICY",
@@ -149,6 +152,7 @@ __all__ = [
     "CheckpointType",
     "CreateSnapshotResponse",
     # Command result
+    "CommandExitReason",
     "CommandResult",
     # Process models
     "ProcessStatus",
