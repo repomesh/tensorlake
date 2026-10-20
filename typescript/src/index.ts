@@ -22,6 +22,37 @@ export {
   listSandboxImages,
 } from "./sandbox-image.js";
 export {
+  ImageBuildCancellationOutcome,
+  ImageBuildErrorCode,
+  ImageBuildKind,
+  ImageBuildPhase,
+  ImageBuildStatus,
+  ImageBuildHandle,
+  ImageBuildError,
+  ImageBuildNotFoundError,
+  ImageBuildInProgressError,
+  ImageBuildFailedError,
+  ImageBuildCancelledError,
+  ImageBuildTimeoutError,
+  ImageBuildInterruptedError,
+  startImageBuild,
+  startImageImport,
+  getImageBuild,
+  waitImageBuild,
+  cancelImageBuild,
+} from "./image-builds.js";
+export type {
+  ImageBuildInfo,
+  ImageBuildResult,
+  ImageBuildEvent,
+  ImageBuildWaitOptions,
+  StartImageBuildOptions,
+  StartImageImportOptions,
+  CancelImageBuildSelector,
+  CancelImageBuildOutcome,
+  ImageBuildErrorDetails,
+} from "./image-builds.js";
+export {
   createFileSystem,
   listFileSystems,
   deleteFileSystem,

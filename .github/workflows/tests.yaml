@@ -50,7 +50,6 @@ jobs:
             tests.applications.test_future_validation \
             tests.applications.test_parse_gitignore \
             tests.applications.test_request_context_headers \
-            tests.cli.test_parse \
             tests.utils.test_retries
           do
             poetry run python -m unittest "$module"
@@ -269,6 +268,8 @@ jobs:
             tests.sandbox.test_ready_timeout \
             tests.sandbox.test_resource_resize \
             tests.image.test_sandbox_builder \
+            tests.image.test_builds \
+            tests.image.test_builds_native \
             tests.image.test_docker_config_native \
             tests.function_agent.test_runner
 

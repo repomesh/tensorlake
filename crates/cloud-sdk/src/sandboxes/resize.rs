@@ -110,11 +110,8 @@ impl ResizeSandboxResources {
                 current.status
             )));
         }
-        if current.runtime.as_deref() == Some("firecracker") {
-            return Err(SdkError::ClientError(
-                "live resource resize is not supported for non-CAS sandboxes".into(),
-            ));
-        }
+        // Which runtimes and dimensions can resize is the server's policy
+        // (ADR 0107 D52): its 4xx message reaches the caller unchanged.
         let mut target = self.clone();
         if let Some(disk) = target.disk_mb
             && (current.resources.disk_mb >= 0 && disk < current.resources.disk_mb as u64)
@@ -134,14 +131,6 @@ impl ResizeSandboxResources {
             && target.disk_mb == Some(current.resources.disk_mb as u64)
         {
             target.disk_mb = None;
-        }
-        if current.runtime.as_deref() == Some("gvisor")
-            && (target.cpus.is_some() || target.memory_mb.is_some())
-        {
-            return Err(SdkError::ClientError(
-                "GPU CAS sandboxes only support live root-disk growth; CPU and memory changes are not supported"
-                    .into(),
-            ));
         }
         Ok(target)
     }
@@ -291,7 +280,9 @@ impl SandboxesClient {
             } else {
                 self.get_within(sandbox_id, remaining).await
             };
-            match observation {
+            // This poller owns a separate resize deadline. Preserve the
+            // underlying failure classification after a bounded read attempt.
+            match observation.map_err(SdkError::into_original) {
                 Ok(info) => {
                     if resize_complete(sandbox_id, generation, &info)? {
                         return Ok(info);

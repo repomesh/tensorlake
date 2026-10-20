@@ -43,6 +43,9 @@ export enum SnapshotStatus {
   LOCAL_READY = "local_ready",
   COMPLETED = "completed",
   FAILED = "failed",
+  DELETING = "deleting",
+  REPLICATING = "replicating",
+  UNKNOWN = "unknown",
 }
 
 /**
@@ -369,6 +372,11 @@ export interface CopySandboxResponse {
 }
 
 export interface SandboxInfo {
+  /**
+   * The runtime the server chose for this sandbox: `firecracker`,
+   * `cloud-hypervisor` or `gvisor`. Informational only; it is never sent and
+   * is `firecracker` when the server recorded none.
+   */
   runtime?: string;
   resourceResize?: SandboxResourceResizeInfo | null;
   sandboxId: string;
@@ -431,6 +439,8 @@ export interface ListArchivedSandboxesResponse {
 export interface CreateSnapshotResponse {
   snapshotId: string;
   status: SnapshotStatus;
+  /** Original response, populated when decoded by the SDK. */
+  raw?: Record<string, unknown>;
 }
 
 export interface SnapshotInfo {
@@ -439,6 +449,8 @@ export interface SnapshotInfo {
   sandboxId: string;
   baseImage: string;
   status: SnapshotStatus;
+  /** Original response, populated when decoded by the SDK. */
+  raw?: Record<string, unknown>;
   snapshotType?: SnapshotType;
   error?: string;
   snapshotUri?: string;

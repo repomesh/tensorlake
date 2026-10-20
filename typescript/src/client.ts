@@ -1,4 +1,5 @@
 import * as defaults from "./defaults.js";
+import { enumValue, withRaw } from "./enum.js";
 import { SandboxError, SandboxPending, formatErrorDetails } from "./errors.js";
 import type { Traced } from "./traced.js";
 import { releaseNativeHandle } from "./native-worker-client.js";
@@ -54,6 +55,19 @@ import { explicitProxyUrlOverride } from "./url.js";
 
 /** Seconds between `GET /sandboxes/{id}` polls while waiting for a sandbox to run (ADR 0086). */
 export const DEFAULT_WAIT_POLL_INTERVAL_SEC = 2;
+
+function parseSnapshot<T extends CreateSnapshotResponse>(raw: Record<string, unknown>): T {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new SandboxError("Invalid snapshot response: expected an object");
+  }
+  if (raw.status == null) {
+    throw new SandboxError("Invalid snapshot response: missing status");
+  }
+  return withRaw({
+    ...fromSnakeKeys(raw, "snapshotId") as Record<string, unknown>,
+    status: enumValue(SnapshotStatus, raw.status),
+  } as T, raw);
+}
 
 const GPU_MODELS = new Set<string>([
   "A100-40GB",
@@ -629,9 +643,9 @@ export class SandboxClient {
   }
 
   /**
-   * Update properties or resize a running sandbox. CPU-only CAS sandboxes support
-   * CPU, memory, and root-disk resize; GPU CAS sandboxes support only root-disk
-   * growth. Non-CAS sandboxes do not support live resize.
+   * Update properties or resize a running sandbox. Which runtimes and
+   * dimensions support a live resize is decided by the server, whose policy
+   * error is thrown unchanged.
    * Resource names match create. Resize waits by default; wait=false returns
    * admission. Timeout leaves the resize running and reports its generation.
    * Wait, timeout, and pollInterval are ignored on non-resource updates.
@@ -963,20 +977,20 @@ export class SandboxClient {
     sandboxId: string,
     options?: SnapshotOptions,
   ): Promise<CreateSnapshotResponse> {
-    return this.plainJson<CreateSnapshotResponse>(
+    const { json } = await callNative(
       () =>
         this.native.createSnapshot(sandboxId, options?.snapshotType ?? null),
-      "snapshotId",
       { sandboxId, notFoundKind: "sandbox" },
     );
+    return parseSnapshot<CreateSnapshotResponse>(JSON.parse(json));
   }
 
   /** Get current status and metadata for a snapshot by ID. */
   async getSnapshot(snapshotId: string): Promise<Traced<SnapshotInfo>> {
-    return this.tracedJson<SnapshotInfo>(
+    const { traceId, json } = await callNative(
       () => this.native.getSnapshot(snapshotId),
-      "snapshotId",
     );
+    return Object.assign(parseSnapshot<SnapshotInfo>(JSON.parse(json)), { traceId });
   }
 
   /** List all snapshots in the namespace. */
@@ -984,12 +998,15 @@ export class SandboxClient {
     const { traceId, json } = await callNative(() =>
       this.native.listSnapshots(),
     );
-    const parsed = JSON.parse(json) as {
-      snapshots?: Record<string, unknown>[];
-    };
-    const snapshots = (parsed.snapshots ?? []).map(
-      (s) => fromSnakeKeys(s, "snapshotId") as SnapshotInfo,
-    );
+    const parsed = JSON.parse(json) as { snapshots?: unknown } | null;
+    if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) {
+      throw new SandboxError("Invalid snapshot list response: expected an object");
+    }
+    const records = parsed?.snapshots ?? [];
+    if (!Array.isArray(records)) {
+      throw new SandboxError("Invalid snapshot list response: snapshots must be an array");
+    }
+    const snapshots = records.map((s) => parseSnapshot<SnapshotInfo>(s));
     return Object.assign(snapshots, { traceId });
   }
 
@@ -1025,6 +1042,11 @@ export class SandboxClient {
       if (info.status === SnapshotStatus.FAILED) {
         throw new SandboxError(
           `Snapshot ${result.snapshotId} failed: ${info.error}`,
+        );
+      }
+      if (info.status === SnapshotStatus.DELETING) {
+        throw new SandboxError(
+          `Snapshot ${result.snapshotId} is being deleted`,
         );
       }
       await sleep(pollInterval * 1000);
@@ -1383,7 +1405,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function snapshotStatusSatisfiesWaitCondition(
-  status: SnapshotStatus | string,
+  status: SnapshotStatus,
   waitUntil: SnapshotWaitCondition,
 ): boolean {
   if (waitUntil === "local_ready") {

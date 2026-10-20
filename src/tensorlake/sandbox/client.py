@@ -1079,12 +1079,11 @@ class SandboxClient:
     ) -> Traced[SandboxInfo]:
         """Update a running sandbox's properties.
 
-        Resource names and units match create. CPU-only CAS sandboxes support CPU,
-        memory, and root-disk resize. GPU CAS sandboxes support only root-disk growth
-        and reject CPU and memory changes. Non-CAS sandboxes do not support live
-        resize. Resize requires a running sandbox and cannot be mixed with name,
-        proxy, or network changes. Omitted dimensions retain their confirmed
-        allocation.
+        Resource names and units match create. Which runtimes and dimensions
+        support a live resize is decided by the server, whose policy error is
+        raised unchanged. Resize requires a running sandbox and cannot be mixed
+        with name, proxy, or network changes. Omitted dimensions retain their
+        confirmed allocation.
         Integer-valued floats such as 2048.0 are accepted for memory and disk;
         fractional values and booleans are rejected without rounding.
 
@@ -1582,9 +1581,7 @@ class SandboxClient:
                     snapshot_type.value if snapshot_type is not None else None
                 ),
             )
-            return Traced(
-                trace_id, CreateSnapshotResponse.model_validate_json(response_json)
-            )
+            return Traced(trace_id, CreateSnapshotResponse.from_response(response_json))
         except Exception as e:
             if _rust_status_code(e) == 404:
                 raise SandboxNotFoundError(sandbox_id) from None
@@ -1607,7 +1604,7 @@ class SandboxClient:
             trace_id, response_json = self._rust_client.get_snapshot_json(
                 snapshot_id=snapshot_id
             )
-            return Traced(trace_id, SnapshotInfo.model_validate_json(response_json))
+            return Traced(trace_id, SnapshotInfo.from_response(response_json))
         except Exception as e:
             _raise_as_sandbox_error(e)
 
@@ -1623,7 +1620,7 @@ class SandboxClient:
         """
         try:
             trace_id, response_json = self._rust_client.list_snapshots_json()
-            data = ListSnapshotsResponse.model_validate(json.loads(response_json))
+            data = ListSnapshotsResponse.from_response(response_json)
             return TracedIterator(trace_id, data.snapshots)
         except Exception as e:
             _raise_as_sandbox_error(e)
@@ -1686,6 +1683,10 @@ class SandboxClient:
             if traced_info.status == SnapshotStatus.FAILED:
                 raise SandboxError(
                     f"Snapshot {traced_create.snapshot_id} failed: {traced_info.error}"
+                )
+            if traced_info.status == SnapshotStatus.DELETING:
+                raise SandboxError(
+                    f"Snapshot {traced_create.snapshot_id} is being deleted"
                 )
             time.sleep(poll_interval)
         raise SandboxError(
