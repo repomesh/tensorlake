@@ -888,6 +888,77 @@ async fn blocking_create_omits_wait_and_an_unset_bound() {
 }
 
 #[tokio::test]
+async fn create_and_wait_returns_every_server_answer_as_a_record() {
+    let (url, server) = scripted_server(vec![
+        (200, r#"{"sandbox_id":"sbx-1","status":"running","sandbox_url":"https://sbx-1.sandbox.tensorlake.ai"}"#),
+        (422, r#"{"sandbox_id":"sbx-2","status":"failed","reason":"no_capacity"}"#),
+        (504, r#"{"sandbox_id":"sbx-3","status":"timeout"}"#),
+    ])
+    .await;
+    let client = ClientBuilder::new(&url)
+        .timeout(Duration::from_secs(8))
+        .build()
+        .expect("build client");
+    let sandboxes = SandboxesClient::new(client, "default", true);
+
+    let running = sandboxes
+        .create_and_wait(&create_request())
+        .await
+        .expect("running");
+    assert_eq!(running.status, "running");
+    let failed = sandboxes
+        .create_and_wait(&create_request())
+        .await
+        .expect("a startup failure is a record, not an error");
+    assert_eq!(failed.sandbox_id, "sbx-2");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.reason.as_deref(), Some("no_capacity"));
+    let timed_out = sandboxes
+        .create_and_wait(&create_request())
+        .await
+        .expect("a timeout is a record, not an error");
+    assert_eq!(timed_out.sandbox_id, "sbx-3");
+    assert_eq!(timed_out.status, "timeout");
+
+    for request in server.await.expect("server join") {
+        let lowered = request.to_ascii_lowercase();
+        // A quarter of the 8 s request timeout is left for the answer.
+        assert!(
+            lowered.contains("x-tensorlake-request-timeout-ms: 8000"),
+            "{request}"
+        );
+        assert!(
+            lowered.contains("x-tensorlake-request-timeout-grace-ms: 2000"),
+            "{request}"
+        );
+        assert!(!request_body(&request).contains("\"wait\""), "{request}");
+    }
+}
+
+#[tokio::test]
+async fn create_and_wait_caps_the_response_grace() {
+    let (url, server) =
+        scripted_server(vec![(200, r#"{"sandbox_id":"sbx-1","status":"running"}"#)]).await;
+    let client = ClientBuilder::new(&url)
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("build client");
+    let sandboxes = SandboxesClient::new(client, "default", true);
+    sandboxes
+        .create_and_wait(&create_request())
+        .await
+        .expect("running");
+    let requests = server.await.expect("server join");
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("x-tensorlake-request-timeout-grace-ms: 5000"),
+        "{}",
+        requests[0]
+    );
+}
+
+#[tokio::test]
 async fn create_no_wait_accepts_the_legacy_blocking_shape_from_older_servers() {
     // A server that predates `wait: false` ignores it and answers the
     // blocking create's shape, possibly already running or timed out.
@@ -1307,6 +1378,163 @@ async fn write_status_json_response(socket: &mut TcpStream, status: u16, body: &
         .write_all(response.as_bytes())
         .await
         .expect("write response");
+}
+
+/// Serve `responses` in order, one connection each, and return the request
+/// lines the client sent.
+async fn serve_snapshot_pages(listener: TcpListener, responses: Vec<&'static str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for response in responses {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let request = read_http_request(&mut socket).await;
+        let request = String::from_utf8_lossy(&request).into_owned();
+        lines.push(request.lines().next().unwrap_or_default().to_string());
+        write_json_response(&mut socket, response).await;
+    }
+    lines
+}
+
+#[tokio::test]
+async fn list_snapshots_follows_the_cursor_to_the_last_page() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(serve_snapshot_pages(
+        listener,
+        vec![
+            r#"{"snapshots":[{"snapshot_id":"suspend-a","namespace":"default","sandbox_id":"a","status":"completed"}],"cursor":"0a0b"}"#,
+            r#"{"snapshots":[{"snapshot_id":"0a791a81","namespace":"default","sandbox_id":"b","status":"completed"}]}"#,
+        ],
+    ));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let ids: Vec<String> = sandboxes
+        .list_snapshots()
+        .await
+        .expect("list snapshots")
+        .into_inner()
+        .into_iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    assert_eq!(ids, ["suspend-a", "0a791a81"]);
+    let lines = server.await.expect("server");
+    // The first page is the request servers without pagination answer whole.
+    assert_eq!(lines[0], "GET /snapshots HTTP/1.1");
+    assert_eq!(lines[1], "GET /snapshots?cursor=0a0b&limit=100 HTTP/1.1");
+}
+
+#[tokio::test]
+async fn list_snapshots_treats_an_empty_cursor_as_the_last_page() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(serve_snapshot_pages(
+        listener,
+        vec![
+            r#"{"snapshots":[{"snapshot_id":"only","namespace":"default","sandbox_id":"a","status":"completed"}],"cursor":""}"#,
+        ],
+    ));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let listed = sandboxes
+        .list_snapshots()
+        .await
+        .expect("list snapshots")
+        .into_inner();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(server.await.expect("server").len(), 1);
+}
+
+#[tokio::test]
+async fn list_snapshots_refuses_a_cursor_cycle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(serve_snapshot_pages(
+        listener,
+        vec![
+            r#"{"snapshots":[],"cursor":"a"}"#,
+            r#"{"snapshots":[],"cursor":"b"}"#,
+            r#"{"snapshots":[],"cursor":"a"}"#,
+        ],
+    ));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let error = sandboxes
+        .list_snapshots()
+        .await
+        .expect_err("a cursor seen before must not loop");
+    assert!(matches!(error, SdkError::ClientError(_)), "{error:?}");
+    assert_eq!(server.await.expect("server").len(), 3);
+}
+
+#[tokio::test]
+async fn list_sandboxes_follows_the_cursor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(serve_snapshot_pages(
+        listener,
+        vec![
+            r#"{"sandboxes":[{"id":"first","namespace":"default","status":"running","resources":{"cpus":1.0,"memory_mb":1024,"disk_mb":10240}}],"cursor":"0a0b"}"#,
+            r#"{"sandboxes":[{"id":"second","namespace":"default","status":"running","resources":{"cpus":1.0,"memory_mb":1024,"disk_mb":10240}}]}"#,
+        ],
+    ));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let listed = sandboxes.list().await.expect("list").into_inner();
+    assert_eq!(listed.len(), 2);
+    let lines = server.await.expect("server");
+    assert_eq!(lines[0], "GET /sandboxes HTTP/1.1");
+    assert_eq!(lines[1], "GET /sandboxes?cursor=0a0b&limit=100 HTTP/1.1");
+}
+
+#[tokio::test]
+async fn list_sandbox_snapshots_reads_the_sandbox_listing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(serve_snapshot_pages(
+        listener,
+        vec![
+            r#"{"snapshots":[{"snapshot_id":"s1","namespace":"default","sandbox_id":"sb","status":"completed"}]}"#,
+        ],
+    ));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let listed = sandboxes
+        .list_sandbox_snapshots("sb")
+        .await
+        .expect("list sandbox snapshots")
+        .into_inner();
+    assert_eq!(listed[0].snapshot_id, "s1");
+    assert_eq!(
+        server.await.expect("server"),
+        ["GET /sandboxes/sb/snapshots HTTP/1.1"]
+    );
+}
+
+#[tokio::test]
+async fn list_snapshots_refuses_a_cursor_that_does_not_advance() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let page = r#"{"snapshots":[],"cursor":"0a0b"}"#;
+    let server = tokio::spawn(serve_snapshot_pages(listener, vec![page, page]));
+    let client = ClientBuilder::new(&format!("http://{address}"))
+        .build()
+        .expect("client");
+    let sandboxes = SandboxesClient::new(client, "default", false);
+    let error = sandboxes
+        .list_snapshots()
+        .await
+        .expect_err("a repeated cursor must not loop");
+    assert!(matches!(error, SdkError::ClientError(_)), "{error:?}");
+    assert_eq!(server.await.expect("server").len(), 2);
 }
 
 async fn read_http_request(socket: &mut TcpStream) -> Vec<u8> {

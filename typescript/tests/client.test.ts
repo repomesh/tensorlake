@@ -1459,9 +1459,10 @@ describe("SandboxClient", () => {
       const deleteSandbox = vi.fn(async () => "t");
       const stub = installNativeStub({
         client: {
+          // The server's own wait ran out: a 504 `timeout` record.
           createSandbox: vi.fn(async () => ({
             traceId: "t",
-            json: JSON.stringify({ sandbox_id: "sbx-timeout", status: "pending" }),
+            json: JSON.stringify({ sandbox_id: "sbx-timeout", status: "timeout" }),
           })),
           waitForSandbox: vi.fn(async (sandboxId: string) => ({
             traceId: "t",
@@ -1488,11 +1489,13 @@ describe("SandboxClient", () => {
       expect(pending.reason).toBe("no_resources_available");
       expect(pending.message).toContain("sbx-timeout");
       expect(pending.message).toContain("keeps its place in the queue");
-      // The create carried `wait: false`; the sandbox is not deleted.
+      // The server waited (no `wait: false`); the sandbox is not deleted.
+      expect(stub.client.createSandboxAndWait).toHaveBeenCalledTimes(1);
+      expect(stub.client.createSandboxNoWait).not.toHaveBeenCalled();
       const body = JSON.parse(
         (stub.client.createSandbox.mock.calls[0] as [string])[0],
       );
-      expect(body.wait).toBe(false);
+      expect(body.wait).toBeUndefined();
       expect(stub.client.waitForSandbox).toHaveBeenCalledWith("sbx-timeout", expect.any(Number), 2);
       expect(deleteSandbox).not.toHaveBeenCalled();
       client.close();
@@ -2083,6 +2086,21 @@ describe("SandboxClient", () => {
       });
       expect(info.status).toBe(SnapshotStatus.COMPLETED);
       expect(getCalls).toBe(2);
+      client.close();
+    });
+
+    it("listSandboxSnapshots reads the sandbox's own listing", async () => {
+      const listSandboxSnapshots = vi.fn(async () => ({
+        traceId: "trace-sandbox-snaps",
+        json: JSON.stringify({ snapshots: [] }),
+      }));
+      installNativeStub({ client: { listSandboxSnapshots } });
+
+      const client = SandboxClient.forLocalhost();
+      const snaps = await client.listSandboxSnapshots("sbx-1");
+      expect(listSandboxSnapshots).toHaveBeenCalledWith("sbx-1");
+      expect(Array.isArray(snaps)).toBe(true);
+      expect(snaps.traceId).toBe("trace-sandbox-snaps");
       client.close();
     });
 

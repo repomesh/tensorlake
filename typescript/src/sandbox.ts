@@ -651,8 +651,8 @@ export class Sandbox {
    *
    * Covers both fresh sandbox creation and restore-from-snapshot (set
    * `snapshotId`). With `wait` unset or `true` it blocks until the sandbox
-   * is `Running`: the create is sent with `wait: false` and the sandbox is
-   * polled every two seconds, with `requestTimeout` as the wait budget.
+   * is `Running`: the server waits and answers as soon as it runs, with
+   * `requestTimeout` as the wait budget.
    *
    * With `wait: false` it returns a {@link PendingSandbox} at once:
    * `pending.ready()` waits for it, `pending.status()` looks at it, and
@@ -1172,9 +1172,7 @@ export class Sandbox {
    */
   async listSnapshots(): Promise<Traced<SnapshotInfo[]>> {
     const client = this.requireLifecycleClient("listSnapshots");
-    const all = await client.listSnapshots();
-    const filtered = all.filter((s) => s.sandboxId === this.lifecycleIdentifier);
-    return Object.assign(filtered, { traceId: all.traceId });
+    return client.listSandboxSnapshots(this.lifecycleIdentifier);
   }
 
   /** Close the proxy connection. The sandbox keeps running. */

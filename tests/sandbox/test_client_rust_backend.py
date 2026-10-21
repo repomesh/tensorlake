@@ -78,6 +78,9 @@ class _FakeRustClient:
     def close(self):
         return None
 
+    def create_sandbox_and_wait(self, *, request_json):
+        return self.create_sandbox(request_json)
+
     def create_sandbox_no_wait(self, *, request_json):
         trace_id, response_json = self.create_sandbox(request_json)
         return trace_id, _pending_from_create(response_json)
@@ -266,6 +269,9 @@ class _RecordingCreateRustClient:
             '{"sandbox_id":"sbx-1","status":"running",'
             '"sandbox_url":"https://sbx-1.sandbox.tensorlake.ai"}',
         )
+
+    def create_sandbox_and_wait(self, *, request_json):
+        return self.create_sandbox(request_json)
 
     def create_sandbox_no_wait(self, *, request_json):
         trace_id, response_json = self.create_sandbox(request_json)
@@ -635,11 +641,13 @@ class TestSandboxClientRustBackend(unittest.TestCase):
         # ADR 0086: a wait that runs out raises SandboxPending with the id and
         # never deletes the sandbox, which keeps its place in the queue.
         class _TimeoutCreateRustClient(_RecordingCreateRustClient):
-            def create_sandbox(self, request_json):
+            def create_sandbox_and_wait(self, *, request_json):
                 self.create_calls += 1
+                self.request_json = request_json
+                # The server's own wait ran out: a 504 `timeout` record.
                 return (
                     "trace-create-sandbox",
-                    '{"sandbox_id":"sbx-timeout","status":"pending","pending_reason":"scheduling"}',
+                    '{"sandbox_id":"sbx-timeout","status":"timeout"}',
                 )
 
         with patch(
@@ -663,7 +671,9 @@ class TestSandboxClientRustBackend(unittest.TestCase):
         self.assertIn("keeps its place in the queue", str(pending))
         request_client = _TimeoutCreateRustClient.instances[1]
         self.assertEqual(request_client.delete_calls, [])
-        # The create carried `wait: false` and the poll used the caller's budget.
+        # The server waited (no `wait: false`); the leftover poll used the
+        # caller's budget.
+        self.assertNotIn("wait", json.loads(request_client.request_json))
         self.assertEqual(request_client.wait_calls[0]["sandbox_id"], "sbx-timeout")
         self.assertLessEqual(request_client.wait_calls[0]["timeout_sec"], 10.0)
 
@@ -2059,6 +2069,27 @@ class TestSandboxClientRustBackend(unittest.TestCase):
         self.assertEqual(snapshot_type, "filesystem")
         self.assertEqual(info.snapshot_id, "snap-1")
         self.assertEqual(info.snapshot_type, SnapshotType.FILESYSTEM)
+
+    def test_list_sandbox_snapshots_reads_the_sandbox_listing(self):
+        calls = []
+
+        class _SandboxListingRustClient(_FakeRustClient):
+            def list_sandbox_snapshots_json(self, sandbox_id):
+                calls.append(sandbox_id)
+                return (
+                    "trace-sandbox-snaps",
+                    '{"snapshots":[{"id":"snap-1","namespace":"default",'
+                    '"sandbox_id":"sbx-1","status":"completed"}]}',
+                )
+
+        client = SandboxClient(api_url="http://localhost:8900", api_key="k")
+        client._rust_client = _SandboxListingRustClient()
+
+        snapshots = client.list_sandbox_snapshots("sbx-1")
+
+        self.assertEqual(calls, ["sbx-1"])
+        self.assertEqual([s.snapshot_id for s in snapshots], ["snap-1"])
+        self.assertEqual(snapshots.trace_id, "trace-sandbox-snaps")
 
     def test_snapshot_and_wait_returns_on_local_ready_by_default(self):
         class _LocalReadyRustClient(_FakeRustClient):
