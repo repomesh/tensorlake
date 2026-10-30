@@ -6,6 +6,7 @@ import json
 import os
 import time
 import warnings
+from collections.abc import Callable
 from typing import Any, Literal, NoReturn, overload
 from urllib.parse import urlparse
 
@@ -291,6 +292,9 @@ def _build_create_request(
     gpu: GpuRequest | None,
     max_pending_secs: int | None,
     wait: bool | None = None,
+    auto_resume: bool | None = None,
+    allow_unauthenticated_access: bool | None = None,
+    exposed_ports: list[int] | None = None,
 ) -> CreateSandboxRequest:
     """Validate create arguments and build the wire request. Shared by the
     sync and async clients so both send byte-identical bodies. ``wait`` is
@@ -333,10 +337,15 @@ def _build_create_request(
         entrypoint=entrypoint,
         network=network,
         snapshot_id=snapshot_id,
+        allow_unauthenticated_access=allow_unauthenticated_access,
+        exposed_ports=(
+            _normalize_user_ports(exposed_ports) if exposed_ports is not None else None
+        ),
         name=name,
         file_systems=file_systems,
         wait=False if wait is False else None,
         max_pending_secs=max_pending_secs,
+        auto_resume=auto_resume,
     )
 
 
@@ -546,6 +555,10 @@ class SandboxClient:
         gpu: GpuRequest | None = None,
         max_pending_secs: int | None = None,
         wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> Traced[CreateSandboxResponse]: ...
 
     @overload
@@ -569,6 +582,9 @@ class SandboxClient:
         max_pending_secs: int | None = None,
         *,
         wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> PendingSandbox: ...
 
     def create(
@@ -590,6 +606,10 @@ class SandboxClient:
         gpu: GpuRequest | None = None,
         max_pending_secs: int | None = None,
         wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "Traced[CreateSandboxResponse] | PendingSandbox":
         """Create a new standalone sandbox.
 
@@ -646,6 +666,8 @@ class SandboxClient:
                 suspend/resume. When absent the sandbox is ephemeral.
             file_systems: File systems to mount into the sandbox
                 at boot, each at its own absolute, unique guest mount path.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
             max_pending_secs: Longest the sandbox may wait for capacity
                 before the server fails it with reason ``no_capacity``.
                 ``0`` fails at once when it cannot be placed; ``None`` (the
@@ -655,6 +677,14 @@ class SandboxClient:
                 more is recommended for capacity waits.
             wait: ``True`` (default) for the blocking create; ``False`` to
                 return a :class:`PendingSandbox` at once.
+            allow_unauthenticated_access: Allow proxy access without
+                authentication when True; require authentication when False.
+                None uses server defaults or inherits the snapshot setting.
+            exposed_ports: User ports to expose through the sandbox proxy.
+                Integers from 1 to 65535, excluding reserved port 9501;
+                duplicates are removed and ports sorted. None uses server
+                defaults or inherits the snapshot setting; [] exposes no
+                user ports.
 
         Returns:
             Traced[CreateSandboxResponse] with ``wait=True``;
@@ -681,10 +711,13 @@ class SandboxClient:
                 allow_out=allow_out,
                 deny_out=deny_out,
                 snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
                 name=name,
                 file_systems=file_systems,
                 gpu=gpu,
                 max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
             )
         request_model = _build_create_request(
             image=image,
@@ -699,10 +732,13 @@ class SandboxClient:
             allow_out=allow_out,
             deny_out=deny_out,
             snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
             name=name,
             file_systems=file_systems,
             gpu=gpu,
             max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
         )
         try:
             trace_id, response_json = self._rust_client.create_sandbox(
@@ -755,6 +791,10 @@ class SandboxClient:
         proxy_url: str | None = None,
         request_timeout: float | None = None,
         owns_sandbox: bool = False,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> PendingSandbox:
         """Send the create with ``wait=False`` and return the pending handle,
         bound to this client so ``ready()`` / ``status()`` work."""
@@ -771,10 +811,13 @@ class SandboxClient:
             allow_out=allow_out,
             deny_out=deny_out,
             snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
             name=name,
             file_systems=file_systems,
             gpu=gpu,
             max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
             wait=False,
         )
         try:
@@ -1093,9 +1136,10 @@ class SandboxClient:
         poll_interval: float = 1.0,
         allow_unauthenticated_access: bool | None = None,
         exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
         network: NetworkConfig | ClearNetworkPolicy | None = None,
     ) -> Traced[SandboxInfo]:
-        """Update a running sandbox's properties.
+        """Update sandbox properties, including auto_resume while suspended.
 
         Resource names and units match create. Which runtimes and dimensions
         support a live resize is decided by the server, whose policy error is
@@ -1127,6 +1171,9 @@ class SandboxClient:
                 be positive. Ignored when wait is False.
             allow_unauthenticated_access: Whether exposed user ports should be
                 reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
             exposed_ports: User ports routable through the sandbox proxy.
                 Port 9501 is reserved for sandbox management.
             network: Egress network policy. Omit to leave it unchanged, pass a
@@ -1154,6 +1201,7 @@ class SandboxClient:
                 name is not None
                 or allow_unauthenticated_access is not None
                 or exposed_ports is not None
+                or auto_resume is not None
                 or network is not None
             ):
                 raise SandboxError(
@@ -1168,6 +1216,7 @@ class SandboxClient:
             name is None
             and allow_unauthenticated_access is None
             and normalized_ports is None
+            and auto_resume is None
             and network_config is None
             and not clearing_network
             and resources is None
@@ -1179,6 +1228,7 @@ class SandboxClient:
             name=name,
             allow_unauthenticated_access=allow_unauthenticated_access,
             exposed_ports=normalized_ports,
+            auto_resume=auto_resume,
             network=network_config,
         )
         # exclude_none omits an unset policy (keep); CLEAR must reach the wire
@@ -1381,11 +1431,16 @@ class SandboxClient:
         sandboxes cannot. By default blocks until the sandbox is fully
         ``Suspended``; pass ``wait=False`` for fire-and-return.
 
+        The server answers as soon as the suspend completes. When its wait
+        runs out first, or the server does not support waiting, the rest of
+        ``timeout`` is spent polling every ``poll_interval`` seconds.
+
         Args:
             sandbox_id: ID or name of the sandbox to suspend
-            wait: If True (default), poll until Suspended; False returns immediately.
+            wait: If True (default), wait until Suspended; False returns immediately.
             timeout: Max seconds to wait when wait=True (default 300)
-            poll_interval: Seconds between polls when wait=True (default 1.0)
+            poll_interval: Seconds between polls once the server's own wait
+                has run out (default 1.0)
 
         Raises:
             SandboxNotFoundError: If sandbox doesn't exist
@@ -1393,25 +1448,18 @@ class SandboxClient:
             RemoteAPIError: If the API request fails
             SandboxConnectionError: If the server is unreachable
         """
-        try:
-            trace_id = self._rust_client.suspend_sandbox(sandbox_id=sandbox_id)
-        except Exception as e:
-            if _rust_status_code(e) == 404:
-                raise SandboxNotFoundError(sandbox_id) from None
-            _raise_as_sandbox_error(e)
-        if not wait:
-            return Traced(trace_id, None)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            info = self.get(sandbox_id).value
-            if info.status == SandboxStatus.SUSPENDED:
-                return Traced(trace_id, None)
-            if info.status == SandboxStatus.TERMINATED:
-                raise SandboxError(
-                    f"Sandbox {sandbox_id!r} terminated while waiting for suspend"
-                )
-            time.sleep(poll_interval)
-        raise SandboxError(f"Sandbox {sandbox_id!r} did not suspend within {timeout}s")
+        return self._change_lifecycle(
+            sandbox_id,
+            "suspend",
+            SandboxStatus.SUSPENDED,
+            lambda: self._rust_client.suspend_sandbox(sandbox_id=sandbox_id),
+            lambda wait_sec: self._rust_client.suspend_sandbox_and_wait(
+                sandbox_id=sandbox_id, wait_sec=wait_sec
+            ),
+            wait,
+            timeout,
+            poll_interval,
+        )
 
     def resume(
         self,
@@ -1425,11 +1473,16 @@ class SandboxClient:
         By default blocks until the sandbox is ``Running``; pass
         ``wait=False`` for fire-and-return.
 
+        The server answers as soon as the sandbox runs. When its wait runs
+        out first, or the server does not support waiting, the rest of
+        ``timeout`` is spent polling every ``poll_interval`` seconds.
+
         Args:
             sandbox_id: ID or name of the sandbox to resume
-            wait: If True (default), poll until Running; False returns immediately.
+            wait: If True (default), wait until Running; False returns immediately.
             timeout: Max seconds to wait when wait=True (default 300)
-            poll_interval: Seconds between polls when wait=True (default 1.0)
+            poll_interval: Seconds between polls once the server's own wait
+                has run out (default 1.0)
 
         Raises:
             SandboxNotFoundError: If sandbox doesn't exist
@@ -1437,25 +1490,62 @@ class SandboxClient:
             RemoteAPIError: If the API request fails
             SandboxConnectionError: If the server is unreachable
         """
-        try:
-            trace_id = self._rust_client.resume_sandbox(sandbox_id=sandbox_id)
-        except Exception as e:
-            if _rust_status_code(e) == 404:
-                raise SandboxNotFoundError(sandbox_id) from None
-            _raise_as_sandbox_error(e)
-        if not wait:
-            return Traced(trace_id, None)
+        return self._change_lifecycle(
+            sandbox_id,
+            "resume",
+            SandboxStatus.RUNNING,
+            lambda: self._rust_client.resume_sandbox(sandbox_id=sandbox_id),
+            lambda wait_sec: self._rust_client.resume_sandbox_and_wait(
+                sandbox_id=sandbox_id, wait_sec=wait_sec
+            ),
+            wait,
+            timeout,
+            poll_interval,
+        )
+
+    def _change_lifecycle(
+        self,
+        sandbox_id: str,
+        action: str,
+        target: SandboxStatus,
+        send: Callable[[], str],
+        send_and_wait: Callable[[float], tuple[str, bool]],
+        wait: bool,
+        timeout: float,
+        poll_interval: float,
+    ) -> Traced[None]:
+        """Send a suspend or resume. With ``wait``, the server waits for
+        ``target`` and answers whether it was reached; when its wait runs out
+        first, the rest of ``timeout`` is spent polling."""
         deadline = time.time() + timeout
+        try:
+            if not wait:
+                return Traced(send(), None)
+            trace_id, settled = send_and_wait(timeout)
+        except Exception as e:
+            status_code = _rust_status_code(e)
+            if status_code == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            if status_code != 409:
+                _raise_as_sandbox_error(e)
+            # The request failed or another one superseded it. A concurrent
+            # request may still have reached the target.
+            info = self.get(sandbox_id)
+            if info.value.status == target:
+                return Traced(info.trace_id, None)
+            _raise_as_sandbox_error(e)
+        if settled:
+            return Traced(trace_id, None)
         while time.time() < deadline:
             info = self.get(sandbox_id).value
-            if info.status == SandboxStatus.RUNNING:
+            if info.status == target:
                 return Traced(trace_id, None)
             if info.status == SandboxStatus.TERMINATED:
                 raise SandboxError(
-                    f"Sandbox {sandbox_id!r} terminated while waiting for resume"
+                    f"Sandbox {sandbox_id!r} terminated while waiting for {action}"
                 )
             time.sleep(poll_interval)
-        raise SandboxError(f"Sandbox {sandbox_id!r} did not resume within {timeout}s")
+        raise SandboxError(f"Sandbox {sandbox_id!r} did not {action} within {timeout}s")
 
     # --- File system operations ---
 
@@ -2105,6 +2195,10 @@ class SandboxClient:
         max_pending_secs: int | None = None,
         cancel_on_timeout: bool = False,
         poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL_SEC,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "Sandbox":
         """Create a sandbox, wait for it to start, and return a connected Sandbox.
 
@@ -2168,6 +2262,8 @@ class SandboxClient:
             file_systems: File systems to mount into the sandbox
                 at boot or warm-pool claim, each at its own absolute, unique
                 guest mount path.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
             max_pending_secs: Server-side bound on the capacity wait; see
                 :meth:`create`. Unset waits indefinitely.
             cancel_on_timeout: Delete the sandbox when ``request_timeout``
@@ -2176,6 +2272,11 @@ class SandboxClient:
                 leave the sandbox queued.
             poll_interval: Seconds between readiness polls once the
                 server's own wait has run out (default 2).
+            allow_unauthenticated_access: Proxy authentication setting; see
+                :meth:`create`. Cannot be combined with ``pool_id`` because
+                pool claims inherit access settings from the pool.
+            exposed_ports: User ports to expose; see :meth:`create`.
+                Cannot be combined with ``pool_id``, including an empty list.
 
         Returns:
             Connected Sandbox instance (auto-terminates in context manager)
@@ -2184,9 +2285,17 @@ class SandboxClient:
             SandboxPending: The wait ran out while the sandbox was still
                 pending (and ``cancel_on_timeout`` is False).
             SandboxError: If the sandbox fails to start; ``reason`` carries
-                the server's reason, such as ``no_capacity``.
+                the server's reason, such as ``no_capacity``. Also raised
+                when access overrides are combined with ``pool_id``.
             SandboxConnectionError: If the server is unreachable
         """
+        if pool_id is not None and (
+            allow_unauthenticated_access is not None or exposed_ports is not None
+        ):
+            raise SandboxError(
+                "allow_unauthenticated_access and exposed_ports cannot be combined "
+                "with pool_id: pool claims inherit access settings from the pool."
+            )
         wait_timeout = (
             request_timeout
             if request_timeout is not None
@@ -2201,6 +2310,8 @@ class SandboxClient:
 
         # claim() never sends `name` to the server, so only the create() path
         # may fall back to the requested name when caching info locally.
+        if pool_id is not None and auto_resume is not None:
+            raise SandboxError("auto_resume cannot be set when claiming from a pool")
         requested_name = None if pool_id is not None else name
         if pool_id is not None:
             result = request_client.claim(pool_id, file_systems=file_systems)
@@ -2221,10 +2332,13 @@ class SandboxClient:
                 allow_out=allow_out,
                 deny_out=deny_out,
                 snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
                 name=name,
                 file_systems=file_systems,
                 gpu=gpu,
                 max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
             )
         if result.status == SandboxStatus.RUNNING:
             sandbox = request_client.connect(

@@ -677,6 +677,7 @@ async fn update_sandbox_replaces_network_policy() {
         .update(
             "sb-1",
             &UpdateSandboxRequest {
+                auto_resume: None,
                 resources: None,
                 name: None,
                 allow_unauthenticated_access: None,
@@ -730,6 +731,7 @@ async fn update_sandbox_clear_sends_explicit_null_network() {
         .update(
             "sb-1",
             &UpdateSandboxRequest {
+                auto_resume: None,
                 resources: None,
                 name: None,
                 allow_unauthenticated_access: None,
@@ -754,6 +756,7 @@ fn sandbox_network_policy_update_wire_shapes() {
     // the tri-state PATCH semantics the running-sandbox update relies on.
     let encode = |network| {
         serde_json::to_string(&UpdateSandboxRequest {
+            auto_resume: None,
             resources: None,
             name: None,
             allow_unauthenticated_access: None,
@@ -820,12 +823,15 @@ fn request_body(request: &str) -> &str {
 
 fn create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
+        auto_resume: None,
         image: Some("tensorlake/ubuntu-minimal".to_string()),
         resources: CreateSandboxResources::default(),
         timeout_secs: None,
         entrypoint: None,
         network: None,
         snapshot_id: None,
+        allow_unauthenticated_access: None,
+        exposed_ports: None,
         name: Some("coreauto-run-17".to_string()),
         file_systems: Vec::new(),
         wait: None,
@@ -885,6 +891,58 @@ async fn blocking_create_omits_wait_and_an_unset_bound() {
     let body = request_body(&requests[0]);
     assert!(!body.contains("\"wait\""), "{body}");
     assert!(!body.contains("max_pending_secs"), "{body}");
+    assert!(!body.contains("allow_unauthenticated_access"), "{body}");
+    assert!(!body.contains("exposed_ports"), "{body}");
+}
+
+#[tokio::test]
+async fn create_forwards_proxy_access_settings_from_native_payloads() {
+    for no_wait in [false, true] {
+        for (payload, public, ports) in [
+            (
+                r#"{"exposed_ports":[3000,8080],"allow_unauthenticated_access":true}"#,
+                Some(true),
+                vec![3000, 8080],
+            ),
+            (
+                r#"{"snapshot_id":"snap-1","exposed_ports":[],"allow_unauthenticated_access":false}"#,
+                Some(false),
+                vec![],
+            ),
+            (r#"{"exposed_ports":[8080]}"#, None, vec![8080]),
+        ] {
+            let (url, server) =
+                scripted_server(vec![(200, r#"{"sandbox_id":"sbx-1","status":"running"}"#)]).await;
+            let client = ClientBuilder::new(&url).build().expect("build client");
+            let sandboxes = SandboxesClient::new(client, "default", false);
+            // Node deserializes the TypeScript payload before the shared Rust
+            // client serializes it again for HTTP. Exercise both boundaries.
+            let request: CreateSandboxRequest =
+                serde_json::from_str(payload).expect("native payload");
+            if no_wait {
+                sandboxes
+                    .create_no_wait(&request)
+                    .await
+                    .expect("queued create");
+            } else {
+                sandboxes.create(&request).await.expect("blocking create");
+            }
+            let requests = server.await.expect("server join");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(request_line(&requests[0]), "POST /sandboxes HTTP/1.1");
+            let body: serde_json::Value =
+                serde_json::from_str(request_body(&requests[0])).expect("HTTP body");
+            assert_eq!(
+                body.get("allow_unauthenticated_access")
+                    .and_then(|value| value.as_bool()),
+                public
+            );
+            assert_eq!(body["exposed_ports"], serde_json::to_value(ports).unwrap());
+            if public.is_none() {
+                assert!(body.get("allow_unauthenticated_access").is_none());
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -953,6 +1011,80 @@ async fn create_and_wait_caps_the_response_grace() {
         requests[0]
             .to_ascii_lowercase()
             .contains("x-tensorlake-request-timeout-grace-ms: 5000"),
+        "{}",
+        requests[0]
+    );
+}
+
+#[tokio::test]
+async fn suspend_and_resume_wait_on_the_server() {
+    let (url, server) = scripted_server(vec![(200, ""), (202, ""), (200, ""), (409, "")]).await;
+    let client = ClientBuilder::new(&url)
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("build client");
+    let sandboxes = SandboxesClient::new(client, "default", true);
+
+    let suspended = sandboxes
+        .suspend_and_wait("sbx-1", Duration::from_secs(10))
+        .await
+        .expect("suspended");
+    assert!(*suspended, "200 means the sandbox is suspended");
+    let pending = sandboxes
+        .suspend_and_wait("sbx-1", Duration::from_secs(300))
+        .await
+        .expect("still suspending");
+    assert!(!*pending, "202 means the wait ran out first");
+    let resumed = sandboxes
+        .resume_and_wait("sbx-1", Duration::from_millis(1500))
+        .await
+        .expect("resumed");
+    assert!(*resumed);
+    let error = sandboxes
+        .resume_and_wait("sbx-1", Duration::from_secs(10))
+        .await
+        .expect_err("a failed resume is an error");
+    assert!(
+        matches!(error, SdkError::ServerError { status, .. } if status == reqwest::StatusCode::CONFLICT),
+        "{error:?}"
+    );
+
+    let requests = server.await.expect("server join");
+    let lines: Vec<&str> = requests.iter().map(|r| request_line(r)).collect();
+    assert!(
+        lines[0].contains("/sandboxes/sbx-1/suspend?wait_ms=10000 "),
+        "{}",
+        lines[0]
+    );
+    // The server holds a lifecycle request open for at most 30 s.
+    assert!(
+        lines[1].contains("/sandboxes/sbx-1/suspend?wait_ms=30000 "),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("/sandboxes/sbx-1/resume?wait_ms=1500 "),
+        "{}",
+        lines[2]
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_wait_leaves_a_response_grace_before_the_request_timeout() {
+    let (url, server) = scripted_server(vec![(200, "")]).await;
+    let client = ClientBuilder::new(&url)
+        .timeout(Duration::from_secs(8))
+        .build()
+        .expect("build client");
+    let sandboxes = SandboxesClient::new(client, "default", true);
+    sandboxes
+        .resume_and_wait("sbx-1", Duration::from_secs(300))
+        .await
+        .expect("resumed");
+    let requests = server.await.expect("server join");
+    // A quarter of the 8 s request timeout is left for the answer.
+    assert!(
+        request_line(&requests[0]).contains("/sandboxes/sbx-1/resume?wait_ms=6000 "),
         "{}",
         requests[0]
     );
@@ -1612,6 +1744,7 @@ fn resize_request(
     resources: tensorlake::sandboxes::models::ResizeSandboxResources,
 ) -> UpdateSandboxRequest {
     UpdateSandboxRequest {
+        auto_resume: None,
         resources: Some(resources),
         name: None,
         allow_unauthenticated_access: None,
@@ -2208,4 +2341,122 @@ async fn resize_zero_timeout_allows_a_response_slower_than_one_second() {
     .expect("a completed resize is observed even if the check takes over one second");
     assert_eq!(info.resources.memory_mb, 1536);
     assert!(server.await.unwrap().starts_with(b"GET "));
+}
+
+#[test]
+fn auto_resume_wire_shapes_and_legacy_default() {
+    use tensorlake::sandboxes::models::SandboxInfo;
+    for value in [None, Some(false), Some(true)] {
+        let mut create = create_request();
+        create.auto_resume = value;
+        let patch: UpdateSandboxRequest = serde_json::from_str("{}").unwrap();
+        let patch = UpdateSandboxRequest {
+            auto_resume: value,
+            ..patch
+        };
+        for wire in [
+            serde_json::to_value(create).unwrap(),
+            serde_json::to_value(patch).unwrap(),
+        ] {
+            assert_eq!(
+                wire.get("auto_resume"),
+                value.map(serde_json::Value::Bool).as_ref()
+            );
+        }
+    }
+    let legacy: SandboxInfo = serde_json::from_str(info("suspended")).unwrap();
+    assert!(legacy.auto_resume);
+    // Both native bindings serialize this model before handing it to the public SDK.
+    assert_eq!(serde_json::to_value(legacy).unwrap()["auto_resume"], true);
+}
+
+#[tokio::test]
+async fn auto_resume_create_patch_and_explicit_resume_transport() {
+    const PARKED: &str = r#"{"id":"sbx-1","namespace":"default","name":"agent","status":"suspended","resources":{"cpus":1,"memory_mb":512,"disk_mb":1024},"auto_resume":false}"#;
+    const RELEASED: &str = r#"{"id":"sbx-1","namespace":"default","name":"agent","status":"suspended","resources":{"cpus":1,"memory_mb":512,"disk_mb":1024},"auto_resume":true}"#;
+    let (url, server) = scripted_server(vec![
+        (200, r#"{"sandbox_id":"sbx-1","status":"running"}"#),
+        (200, PARKED),
+        (200, "{}"),
+        (200, PARKED),
+        (200, RELEASED),
+    ])
+    .await;
+    let sandboxes =
+        SandboxesClient::new(ClientBuilder::new(&url).build().unwrap(), "default", true);
+    let mut create = create_request();
+    create.auto_resume = Some(false);
+    sandboxes.create(&create).await.unwrap();
+    let mut patch: UpdateSandboxRequest = serde_json::from_str(r#"{"auto_resume":false}"#).unwrap();
+    let parked = sandboxes.update("sbx-1", &patch).await.unwrap();
+    assert!(!parked.auto_resume);
+    assert_eq!(parked.status, "suspended");
+    sandboxes.resume("sbx-1").await.unwrap();
+    assert!(!sandboxes.get("sbx-1").await.unwrap().auto_resume);
+    patch.auto_resume = Some(true);
+    let released = sandboxes.update("sbx-1", &patch).await.unwrap();
+    assert!(released.auto_resume);
+    assert_eq!(released.status, "suspended");
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&requests[0])).unwrap()["auto_resume"],
+        false
+    );
+    assert_eq!(request_body(&requests[1]), r#"{"auto_resume":false}"#);
+    assert!(request_line(&requests[2]).contains("/resume "));
+    assert_eq!(request_body(&requests[4]), r#"{"auto_resume":true}"#);
+}
+
+#[tokio::test]
+async fn auto_resume_cannot_be_combined_with_resize() {
+    let sandboxes = SandboxesClient::new(
+        ClientBuilder::new("http://127.0.0.1:1").build().unwrap(),
+        "default",
+        true,
+    );
+    let request: UpdateSandboxRequest =
+        serde_json::from_str(r#"{"auto_resume":false,"resources":{"cpus":2}}"#).unwrap();
+    let error = sandboxes.update("sbx-1", &request).await.unwrap_err();
+    assert!(matches!(error, SdkError::ClientError(_)));
+}
+
+#[tokio::test]
+async fn auto_resume_disabled_proxy_error_is_final() {
+    const BODY: &str =
+        r#"{"error":"Sandbox automatic resume is disabled","code":"SANDBOX_AUTO_RESUME_DISABLED"}"#;
+    let (url, server) = scripted_server(vec![(409, BODY)]).await;
+    let proxy = run_stream_proxy(&url, Duration::from_secs(2));
+    let error = proxy
+        .run_process(&serde_json::json!({"command":"true"}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.upstream_error_code().as_deref(),
+        Some("SANDBOX_AUTO_RESUME_DISABLED")
+    );
+    assert!(!error.never_reached_server());
+    assert!(!is_transient(&error));
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_resume_unnamed_rejection_preserves_server_error() {
+    const BODY: &str = r#"{"message":"auto_resume: false requires a named sandbox"}"#;
+    let (url, server) = scripted_server(vec![(400, BODY), (400, BODY)]).await;
+    let sandboxes =
+        SandboxesClient::new(ClientBuilder::new(&url).build().unwrap(), "default", true);
+    let mut create = create_request();
+    create.name = None;
+    create.auto_resume = Some(false);
+    let patch: UpdateSandboxRequest = serde_json::from_str(r#"{"auto_resume":false}"#).unwrap();
+    for error in [
+        sandboxes.create(&create).await.unwrap_err(),
+        sandboxes.update("ephemeral", &patch).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(error, SdkError::ServerError { status, message } if status.as_u16() == 400 && message == BODY)
+        );
+    }
+    assert_eq!(server.await.unwrap().len(), 2);
 }

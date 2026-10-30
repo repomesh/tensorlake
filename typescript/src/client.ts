@@ -1,6 +1,11 @@
 import * as defaults from "./defaults.js";
 import { enumValue, withRaw } from "./enum.js";
-import { SandboxError, SandboxPending, formatErrorDetails } from "./errors.js";
+import {
+  RemoteAPIError,
+  SandboxError,
+  SandboxPending,
+  formatErrorDetails,
+} from "./errors.js";
 import type { Traced } from "./traced.js";
 import { releaseNativeHandle } from "./native-worker-client.js";
 import {
@@ -515,6 +520,12 @@ export class SandboxClient {
     if (options?.timeoutSecs != null) body.timeout_secs = options.timeoutSecs;
     if (options?.entrypoint != null) body.entrypoint = options.entrypoint;
     if (options?.snapshotId != null) body.snapshot_id = options.snapshotId;
+    if (options?.allowUnauthenticatedAccess != null) {
+      body.allow_unauthenticated_access = options.allowUnauthenticatedAccess;
+    }
+    if (options?.exposedPorts != null) {
+      body.exposed_ports = normalizeUserPorts(options.exposedPorts);
+    }
     if (options?.name != null) body.name = options.name;
     if (options?.fileSystems != null && options.fileSystems.length > 0) {
       body.file_systems = options.fileSystems.map(fileSystemMountToWire);
@@ -531,6 +542,7 @@ export class SandboxClient {
         deny_out: options?.denyOut ?? [],
       };
     }
+    if (options?.autoResume != null) body.auto_resume = options.autoResume;
     if (options?.maxPendingSecs != null) {
       if (
         !Number.isInteger(options.maxPendingSecs) ||
@@ -678,6 +690,7 @@ export class SandboxClient {
         options.name != null ||
         options.allowUnauthenticatedAccess != null ||
         options.exposedPorts != null ||
+        options.autoResume != null ||
         options.network !== undefined
       ) {
         throw new SandboxError(
@@ -686,6 +699,7 @@ export class SandboxClient {
       }
       body.resources = resources;
     }
+    if (options.autoResume != null) body.auto_resume = options.autoResume;
     if (options.name != null) body.name = options.name;
     if (options.allowUnauthenticatedAccess != null) {
       body.allow_unauthenticated_access = options.allowUnauthenticatedAccess;
@@ -800,31 +814,22 @@ export class SandboxClient {
    * cannot. By default blocks until the sandbox is fully `Suspended`. Pass
    * `{ wait: false }` to return immediately after the request is sent
    * (fire-and-return); the server processes the suspend asynchronously.
+   *
+   * The server answers as soon as the suspend completes. When its wait runs
+   * out first, or the server does not support waiting, the rest of `timeout`
+   * is spent polling every `pollInterval` seconds.
    */
   async suspend(
     sandboxId: string,
     options?: SuspendResumeOptions,
   ): Promise<void> {
-    await callNative(() => this.native.suspendSandbox(sandboxId), {
+    await this.changeLifecycle(
       sandboxId,
-      notFoundKind: "sandbox",
-    });
-    if (options?.wait === false) return;
-    const timeout = options?.timeout ?? 300;
-    const pollInterval = options?.pollInterval ?? 1;
-    const deadline = Date.now() + timeout * 1000;
-    while (Date.now() < deadline) {
-      const info = await this.get(sandboxId);
-      if (info.status === SandboxStatus.SUSPENDED) return;
-      if (info.status === SandboxStatus.TERMINATED) {
-        throw new SandboxError(
-          `Sandbox ${sandboxId} terminated while waiting for suspend`,
-        );
-      }
-      await sleep(pollInterval * 1000);
-    }
-    throw new SandboxError(
-      `Sandbox ${sandboxId} did not suspend within ${timeout}s`,
+      "suspend",
+      SandboxStatus.SUSPENDED,
+      () => this.native.suspendSandbox(sandboxId),
+      (waitSec) => this.native.suspendSandboxAndWait(sandboxId, waitSec),
+      options,
     );
   }
 
@@ -834,31 +839,71 @@ export class SandboxClient {
    * By default blocks until the sandbox is `Running` and routable. Pass
    * `{ wait: false }` to return immediately after the request is sent
    * (fire-and-return); the server processes the resume asynchronously.
+   *
+   * The server answers as soon as the sandbox runs. When its wait runs out
+   * first, or the server does not support waiting, the rest of `timeout` is
+   * spent polling every `pollInterval` seconds.
    */
   async resume(
     sandboxId: string,
     options?: SuspendResumeOptions,
   ): Promise<void> {
-    await callNative(() => this.native.resumeSandbox(sandboxId), {
+    await this.changeLifecycle(
       sandboxId,
-      notFoundKind: "sandbox",
-    });
-    if (options?.wait === false) return;
+      "resume",
+      SandboxStatus.RUNNING,
+      () => this.native.resumeSandbox(sandboxId),
+      (waitSec) => this.native.resumeSandboxAndWait(sandboxId, waitSec),
+      options,
+    );
+  }
+
+  /**
+   * Send a suspend or resume. With `wait`, the server waits for `target` and
+   * answers whether it was reached; when its wait runs out first, the rest of
+   * the timeout is spent polling.
+   */
+  private async changeLifecycle(
+    sandboxId: string,
+    action: "suspend" | "resume",
+    target: SandboxStatus,
+    send: () => Promise<string>,
+    sendAndWait: (waitSec: number) => Promise<boolean>,
+    options?: SuspendResumeOptions,
+  ): Promise<void> {
+    const context = { sandboxId, notFoundKind: "sandbox" } as const;
+    if (options?.wait === false) {
+      await callNative(send, context);
+      return;
+    }
     const timeout = options?.timeout ?? 300;
     const pollInterval = options?.pollInterval ?? 1;
     const deadline = Date.now() + timeout * 1000;
+    let settled: boolean;
+    try {
+      settled = await callNative(() => sendAndWait(timeout), context);
+    } catch (error) {
+      if (!(error instanceof RemoteAPIError) || error.statusCode !== 409) {
+        throw error;
+      }
+      // The request failed or another one superseded it. A concurrent
+      // request may still have reached the target.
+      if ((await this.get(sandboxId)).status === target) return;
+      throw error;
+    }
+    if (settled) return;
     while (Date.now() < deadline) {
       const info = await this.get(sandboxId);
-      if (info.status === SandboxStatus.RUNNING) return;
+      if (info.status === target) return;
       if (info.status === SandboxStatus.TERMINATED) {
         throw new SandboxError(
-          `Sandbox ${sandboxId} terminated while waiting for resume`,
+          `Sandbox ${sandboxId} terminated while waiting for ${action}`,
         );
       }
       await sleep(pollInterval * 1000);
     }
     throw new SandboxError(
-      `Sandbox ${sandboxId} did not resume within ${timeout}s`,
+      `Sandbox ${sandboxId} did not ${action} within ${timeout}s`,
     );
   }
 
@@ -1207,6 +1252,15 @@ export class SandboxClient {
    * claim that is still starting is then waited on the same way.
    */
   async createAndConnect(options?: CreateAndConnectOptions): Promise<Sandbox> {
+    if (
+      options?.poolId != null &&
+      (options.allowUnauthenticatedAccess != null || options.exposedPorts != null)
+    ) {
+      throw new SandboxError(
+        "allowUnauthenticatedAccess and exposedPorts cannot be combined with poolId: " +
+          "pool claims inherit access settings from the pool.",
+      );
+    }
     const opStart = nowMs();
     const requestTimeout =
       options?.requestTimeout ??
@@ -1226,6 +1280,9 @@ export class SandboxClient {
       options?.poolId != null ? null : (options?.name ?? null);
     const createStart = nowMs();
     let result: Traced<CreateSandboxResponse>;
+    if (options?.poolId != null && options.autoResume != null) {
+      throw new SandboxError("autoResume cannot be set when claiming from a pool");
+    }
     if (options?.poolId != null) {
       result = await requestClient.claim(options.poolId, {
         fileSystems: options.fileSystems,

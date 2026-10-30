@@ -41,6 +41,98 @@ describe("SandboxClient", () => {
   });
 
   describe("create", () => {
+    it.each(["create", "queued", "createAndConnect", "Sandbox.create"] as const)(
+      "%s configures exposed ports in the initial request",
+      async (operation) => {
+        const stub = installNativeStub({
+          client: {
+            createSandbox: vi.fn(async () => ({
+              traceId: "t",
+              json: JSON.stringify({
+                sandbox_id: "sbx-ports",
+                status: "running",
+                sandbox_url: "https://sbx-ports.sandbox.tensorlake.ai",
+              }),
+            })),
+          },
+        });
+        const client = SandboxClient.forLocalhost();
+        const options = {
+          exposedPorts: [8080, 3000, 8080],
+          allowUnauthenticatedAccess: true,
+        };
+        try {
+          if (operation === "Sandbox.create") {
+            (await Sandbox.create({ ...options, apiKey: "test-key" })).close();
+          } else if (operation === "createAndConnect") {
+            (await client.createAndConnect(options)).close();
+          } else if (operation === "queued") {
+            expect(await client.create({ ...options, wait: false })).toBeInstanceOf(PendingSandbox);
+          } else {
+            await client.create(options);
+          }
+          expect(stub.client.createSandbox).toHaveBeenCalledOnce();
+          expect(JSON.parse(stub.client.createSandbox.mock.calls[0][0])).toMatchObject({
+            exposed_ports: [3000, 8080],
+            allow_unauthenticated_access: true,
+          });
+          expect(options.exposedPorts).toEqual([8080, 3000, 8080]);
+          expect(stub.client.updateSandbox).not.toHaveBeenCalled();
+        } finally {
+          client.close();
+        }
+      },
+    );
+
+    it("can clear inherited ports and require authentication on snapshot restore", async () => {
+      const stub = installNativeStub();
+      const client = SandboxClient.forLocalhost();
+      try {
+        await client.create({
+          snapshotId: "snap-ports",
+          exposedPorts: [],
+          allowUnauthenticatedAccess: false,
+        });
+        expect(JSON.parse(stub.client.createSandbox.mock.calls[0][0])).toEqual({
+          snapshot_id: "snap-ports",
+          exposed_ports: [],
+          allow_unauthenticated_access: false,
+        });
+      } finally {
+        client.close();
+      }
+    });
+
+    it("does not enable unauthenticated access implicitly when exposing ports", async () => {
+      const stub = installNativeStub();
+      const client = SandboxClient.forLocalhost();
+      try {
+        await client.create({ exposedPorts: [8080] });
+        const body = JSON.parse(stub.client.createSandbox.mock.calls[0][0]);
+        expect(body.exposed_ports).toEqual([8080]);
+        expect(body).not.toHaveProperty("allow_unauthenticated_access");
+      } finally {
+        client.close();
+      }
+    });
+
+    it.each([0, -1, 65536, 1.5, NaN, Infinity, 9501])(
+      "rejects exposed port %s before creating a sandbox",
+      async (port) => {
+        const stub = installNativeStub();
+        const client = SandboxClient.forLocalhost();
+        try {
+          for (const wait of [true, false]) {
+            await expect(client.create({ exposedPorts: [port], wait })).rejects.toThrow(SandboxError);
+          }
+          expect(stub.client.createSandbox).not.toHaveBeenCalled();
+          expect(stub.client.createSandboxNoWait).not.toHaveBeenCalled();
+        } finally {
+          client.close();
+        }
+      },
+    );
+
     it("surfaces structured configuration diagnostics from the native HTTP error", async () => {
       const diagnosis =
         "Cannot mount /tools: overlaps the registered mount /tools. Remove the conflicting registration.";
@@ -144,6 +236,8 @@ describe("SandboxClient", () => {
               cpus: 1.0,
               memory_mb: 1024,
             });
+            expect(body).not.toHaveProperty("exposed_ports");
+            expect(body).not.toHaveProperty("allow_unauthenticated_access");
             return {
               traceId: "t",
               json: JSON.stringify({ sandbox_id: "sbx-1", status: "pending" }),
@@ -856,9 +950,26 @@ describe("SandboxClient", () => {
       client.close();
     });
 
-    it("polls until Suspended when wait=true (default)", async () => {
+    it("waits on the server when wait=true (default)", async () => {
+      const stub = installNativeStub();
+
+      const client = SandboxClient.forLocalhost();
+      await expect(
+        client.suspend("sbx-1", { timeout: 20 }),
+      ).resolves.toBeUndefined();
+      expect(stub.client.suspendSandboxAndWait).toHaveBeenCalledWith(
+        "sbx-1",
+        20,
+      );
+      expect(stub.client.suspendSandbox).not.toHaveBeenCalled();
+      expect(stub.client.getSandbox).not.toHaveBeenCalled();
+      client.close();
+    });
+
+    it("polls until Suspended when the server wait runs out", async () => {
       const stub = installNativeStub({
         client: {
+          suspendSandboxAndWait: vi.fn(async () => false),
           getSandbox: vi.fn(async () => ({
             traceId: "t",
             json: JSON.stringify({
@@ -873,7 +984,10 @@ describe("SandboxClient", () => {
 
       const client = SandboxClient.forLocalhost();
       await expect(client.suspend("sbx-1")).resolves.toBeUndefined();
-      expect(stub.client.suspendSandbox).toHaveBeenCalledWith("sbx-1");
+      expect(stub.client.suspendSandboxAndWait).toHaveBeenCalledWith(
+        "sbx-1",
+        300,
+      );
       expect(stub.client.getSandbox).toHaveBeenCalled();
       client.close();
     });
@@ -891,9 +1005,24 @@ describe("SandboxClient", () => {
       client.close();
     });
 
-    it("polls until Running when wait=true (default)", async () => {
+    it("waits on the server when wait=true (default)", async () => {
+      const stub = installNativeStub();
+
+      const client = SandboxClient.forLocalhost();
+      await expect(client.resume("sbx-1")).resolves.toBeUndefined();
+      expect(stub.client.resumeSandboxAndWait).toHaveBeenCalledWith(
+        "sbx-1",
+        300,
+      );
+      expect(stub.client.resumeSandbox).not.toHaveBeenCalled();
+      expect(stub.client.getSandbox).not.toHaveBeenCalled();
+      client.close();
+    });
+
+    it("polls until Running when the server wait runs out", async () => {
       const stub = installNativeStub({
         client: {
+          resumeSandboxAndWait: vi.fn(async () => false),
           getSandbox: vi.fn(async () => ({
             traceId: "t",
             json: JSON.stringify({
@@ -908,8 +1037,56 @@ describe("SandboxClient", () => {
 
       const client = SandboxClient.forLocalhost();
       await expect(client.resume("sbx-1")).resolves.toBeUndefined();
-      expect(stub.client.resumeSandbox).toHaveBeenCalledWith("sbx-1");
       expect(stub.client.getSandbox).toHaveBeenCalled();
+      client.close();
+    });
+
+    it("returns on a conflict when the sandbox is already running", async () => {
+      const stub = installNativeStub({
+        client: {
+          resumeSandboxAndWait: vi.fn(async () => {
+            throw nativeError(409, "superseded");
+          }),
+          getSandbox: vi.fn(async () => ({
+            traceId: "t",
+            json: JSON.stringify({
+              id: "sbx-1",
+              status: "running",
+              namespace: "default",
+              resources: { cpus: 1, memory_mb: 1024, disk_mb: 1024 },
+            }),
+          })),
+        },
+      });
+
+      const client = SandboxClient.forLocalhost();
+      await expect(client.resume("sbx-1")).resolves.toBeUndefined();
+      expect(stub.client.getSandbox).toHaveBeenCalledTimes(1);
+      client.close();
+    });
+
+    it("raises a conflict when the resume failed", async () => {
+      installNativeStub({
+        client: {
+          resumeSandboxAndWait: vi.fn(async () => {
+            throw nativeError(409, "Resident resume failed");
+          }),
+          getSandbox: vi.fn(async () => ({
+            traceId: "t",
+            json: JSON.stringify({
+              id: "sbx-1",
+              status: "suspended",
+              namespace: "default",
+              resources: { cpus: 1, memory_mb: 1024, disk_mb: 1024 },
+            }),
+          })),
+        },
+      });
+
+      const client = SandboxClient.forLocalhost();
+      await expect(client.resume("sbx-1")).rejects.toMatchObject({
+        statusCode: 409,
+      });
       client.close();
     });
   });
@@ -1261,6 +1438,32 @@ describe("SandboxClient", () => {
   });
 
   describe("createAndConnect", () => {
+    for (const operation of ["createAndConnect", "Sandbox.create"] as const) {
+      it.each([
+        { allowUnauthenticatedAccess: false },
+        { allowUnauthenticatedAccess: true },
+        { exposedPorts: [] },
+        { exposedPorts: [3000] },
+        { allowUnauthenticatedAccess: false, exposedPorts: [] },
+      ])(`${operation} rejects access overrides before claiming from a pool`, async (access) => {
+        const stub = installNativeStub();
+        const client = SandboxClient.forLocalhost();
+        const options = { poolId: "pool-1", ...access };
+        try {
+          await expect(
+            operation === "Sandbox.create"
+              ? Sandbox.create({ ...options, apiKey: "test-key" })
+              : client.createAndConnect(options),
+          ).rejects.toThrow("cannot be combined with poolId");
+          expect(stub.client.claimSandbox).not.toHaveBeenCalled();
+          expect(stub.client.createSandbox).not.toHaveBeenCalled();
+          expect(stub.client.updateSandbox).not.toHaveBeenCalled();
+        } finally {
+          client.close();
+        }
+      });
+    }
+
     it("threads file systems through a warm-pool claim", async () => {
       const claimSandbox = vi.fn(async () => ({
         traceId: "t",

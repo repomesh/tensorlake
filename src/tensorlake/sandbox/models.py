@@ -444,12 +444,16 @@ class FileSystem(BaseModel):
 class CreateSandboxRequest(BaseModel):
     """Request payload for creating a sandbox."""
 
+    auto_resume: bool | None = None
+
     image: str | None = None
     resources: CreateSandboxResources | None = None
     timeout_secs: int | None = None
     entrypoint: list[str] | None = None
     network: NetworkConfig | None = None
     snapshot_id: str | None = None
+    allow_unauthenticated_access: bool | None = None
+    exposed_ports: list[int] | None = None
     name: str | None = None
     file_systems: list[FileSystemMount] | None = None
     # ``False`` asks the server to answer as soon as the sandbox is durable
@@ -515,6 +519,8 @@ class UpdateSandboxRequest(BaseModel):
     or sending an explicit ``null``; the client builds those from the
     :data:`CLEAR_NETWORK_POLICY` sentinel rather than this model.
     """
+
+    auto_resume: bool | None = None
 
     resources: ResizeSandboxResources | None = None
     name: str | None = None
@@ -731,6 +737,8 @@ class CopySandboxResponse(BaseModel):
 
 class SandboxInfo(BaseModel):
     """Full sandbox information."""
+
+    auto_resume: bool = True
 
     sandbox_id: str = Field(alias="id")
     namespace: str

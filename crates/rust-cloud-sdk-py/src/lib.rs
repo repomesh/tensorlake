@@ -10,7 +10,7 @@ mod tunnel;
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tensorlake::sandboxes::resize::ResizeOptions;
 
 use futures::StreamExt;
@@ -46,6 +46,7 @@ use tensorlake::sandboxes::{
     DEFAULT_WAIT_POLL_INTERVAL, SandboxDesktopClient as RustSandboxDesktopClient,
     SandboxProxyClient, SandboxesClient, resolve_sandbox_proxy_target, select_sandbox_proxy_url,
 };
+use tensorlake::usage::{UsageClient, UsageWindow};
 use tensorlake::{
     Client, ClientBuilder,
     error::{SdkError, TransportFailure},
@@ -133,6 +134,41 @@ impl CloudApiClient {
 
     fn close(&self) {
         // reqwest clients are closed when dropped; this is a no-op for API parity.
+    }
+
+    /// Organization usage totals for the current billing period, or for the
+    /// last `1d`, `7d` or `30d`.
+    #[pyo3(signature = (organization_id, last=None))]
+    fn sandbox_usage_summary_json(
+        &self,
+        organization_id: String,
+        last: Option<String>,
+    ) -> PyResult<String> {
+        let window = usage_window(last.as_deref())?;
+        self.run_with_retry(5, move |client| {
+            let usage = UsageClient::new(client, organization_id.clone());
+            async move {
+                let traced = usage.summary(window).await?;
+                serde_json::to_string(&*traced).map_err(SdkError::from)
+            }
+        })
+    }
+
+    /// Every sandbox of the window with its usage and attributed charge.
+    #[pyo3(signature = (organization_id, last=None))]
+    fn sandbox_usage_export_json(
+        &self,
+        organization_id: String,
+        last: Option<String>,
+    ) -> PyResult<String> {
+        let window = usage_window(last.as_deref())?;
+        self.run_with_retry(5, move |client| {
+            let usage = UsageClient::new(client, organization_id.clone());
+            async move {
+                let traced = usage.sandboxes(window).await?;
+                serde_json::to_string(&*traced).map_err(SdkError::from)
+            }
+        })
     }
 
     /// Return the project selected by ingress for Artifact Storage operations.
@@ -1815,6 +1851,48 @@ impl CloudSandboxClient {
         })
     }
 
+    /// Suspend that waits on the server for up to `wait_sec`. Returns the
+    /// trace id and whether the server answered that the sandbox is
+    /// suspended; `false` means the wait ran out first.
+    fn suspend_sandbox_and_wait(
+        &self,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> PyResult<(String, bool)> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        // Retries share one budget, so a retried wait never runs past it.
+        let deadline = Instant::now() + wait;
+        self.run_with_retry(5, move |client| {
+            let sandbox_id = sandbox_id.clone();
+            let wait = deadline.saturating_duration_since(Instant::now());
+            async move {
+                let traced = client.suspend_and_wait(&sandbox_id, wait).await?;
+                Ok((traced.trace_id.clone(), *traced))
+            }
+        })
+    }
+
+    /// Resume that waits on the server for up to `wait_sec`. Returns the
+    /// trace id and whether the server answered that the sandbox is running;
+    /// `false` means the wait ran out first.
+    fn resume_sandbox_and_wait(
+        &self,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> PyResult<(String, bool)> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        // Retries share one budget, so a retried wait never runs past it.
+        let deadline = Instant::now() + wait;
+        self.run_with_retry(5, move |client| {
+            let sandbox_id = sandbox_id.clone();
+            let wait = deadline.saturating_duration_since(Instant::now());
+            async move {
+                let traced = client.resume_and_wait(&sandbox_id, wait).await?;
+                Ok((traced.trace_id.clone(), *traced))
+            }
+        })
+    }
+
     #[pyo3(signature = (sandbox_id, file_system_id, mount_path, read_only=false, prefetch=false, snapshot_id=None, owner=None))]
     fn attach_file_system(
         &self,
@@ -2354,6 +2432,52 @@ impl CloudSandboxClient {
             .await
             .map_err(into_sandbox_py_error)?;
             Ok(trace_id)
+        })
+    }
+
+    /// Awaitable counterpart of `suspend_sandbox_and_wait`.
+    fn suspend_sandbox_and_wait_async<'py>(
+        &self,
+        py: Python<'py>,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        let client = self.client.clone();
+        future_into_py(py, async move {
+            // Retries share one budget, so a retried wait never runs past it.
+            let deadline = Instant::now() + wait;
+            let traced = retry_async_op(client, 5, move |c| {
+                let sandbox_id = sandbox_id.clone();
+                let wait = deadline.saturating_duration_since(Instant::now());
+                async move { c.suspend_and_wait(&sandbox_id, wait).await }
+            })
+            .await
+            .map_err(into_sandbox_py_error)?;
+            Ok((traced.trace_id.clone(), *traced))
+        })
+    }
+
+    /// Awaitable counterpart of `resume_sandbox_and_wait`.
+    fn resume_sandbox_and_wait_async<'py>(
+        &self,
+        py: Python<'py>,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        let client = self.client.clone();
+        future_into_py(py, async move {
+            // Retries share one budget, so a retried wait never runs past it.
+            let deadline = Instant::now() + wait;
+            let traced = retry_async_op(client, 5, move |c| {
+                let sandbox_id = sandbox_id.clone();
+                let wait = deadline.saturating_duration_since(Instant::now());
+                async move { c.resume_and_wait(&sandbox_id, wait).await }
+            })
+            .await
+            .map_err(into_sandbox_py_error)?;
+            Ok((traced.trace_id.clone(), *traced))
         })
     }
 
@@ -3902,6 +4026,15 @@ where
     Fut: Future<Output = Result<T, SdkError>>,
 {
     retry(client, RetryPolicy::non_idempotent(), op).await
+}
+
+fn usage_window(last: Option<&str>) -> PyResult<UsageWindow> {
+    match last {
+        None => Ok(UsageWindow::CurrentPeriod),
+        Some(value) => value
+            .parse()
+            .map_err(|error: SdkError| pyo3::exceptions::PyValueError::new_err(error.to_string())),
+    }
 }
 
 fn into_py_error(error: SdkError) -> PyErr {

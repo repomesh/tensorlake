@@ -118,6 +118,8 @@ export interface NativeSandboxClient {
   deleteSandbox(sandboxId: string): Promise<string>;
   suspendSandbox(sandboxId: string): Promise<string>;
   resumeSandbox(sandboxId: string): Promise<string>;
+  suspendSandboxAndWait(sandboxId: string, waitSec: number): Promise<boolean>;
+  resumeSandboxAndWait(sandboxId: string, waitSec: number): Promise<boolean>;
   attachFileSystem(
     sandboxId: string,
     fileSystemId: string,
@@ -263,6 +265,21 @@ interface NativeRepositoryClientCtor {
   ): NativeRepositoryClient;
 }
 
+export interface NativeUsageClient {
+  summary(last: string | null): Promise<TracedJson>;
+  sandboxes(last: string | null): Promise<TracedJson>;
+}
+
+interface NativeUsageClientCtor {
+  new (
+    apiUrl: string,
+    apiKey: string | null,
+    organizationId: string,
+    userAgent?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeUsageClient;
+}
+
 interface NativeSandboxProxyClientCtor {
   new (
     proxyUrl: string,
@@ -282,6 +299,7 @@ export interface NativeSandboxBinding {
   NativeSandboxClient: NativeSandboxClientCtor;
   NativeSandboxProxyClient: NativeSandboxProxyClientCtor;
   NativeRepositoryClient?: NativeRepositoryClientCtor;
+  NativeUsageClient?: NativeUsageClientCtor;
   /** Validate a managed-process name; throws on failure. Single source-of-truth rule in Rust. */
   validateManagedName: (name: string) => void | Promise<void>;
 }

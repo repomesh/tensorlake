@@ -295,6 +295,10 @@ class AsyncSandbox:
         max_pending_secs: int | None = None,
         cancel_on_timeout: bool = False,
         wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "AsyncSandbox": ...
 
     @overload
@@ -329,6 +333,9 @@ class AsyncSandbox:
         cancel_on_timeout: bool = False,
         *,
         wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> AsyncPendingSandbox: ...
 
     @classmethod
@@ -361,6 +368,10 @@ class AsyncSandbox:
         max_pending_secs: int | None = None,
         cancel_on_timeout: bool = False,
         wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "AsyncSandbox | AsyncPendingSandbox":
         """Create a new sandbox and return a connected, running handle.
 
@@ -411,10 +422,13 @@ class AsyncSandbox:
                 allow_out=allow_out,
                 deny_out=deny_out,
                 snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
                 name=name,
                 file_systems=file_systems,
                 gpu=gpu,
                 max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
                 proxy_url=proxy_url,
                 request_timeout=effective_request_timeout,
                 owns_sandbox=True,
@@ -433,12 +447,15 @@ class AsyncSandbox:
             deny_out=deny_out,
             pool_id=pool_id,
             snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
             proxy_url=proxy_url,
             request_timeout=effective_request_timeout,
             name=name,
             file_systems=file_systems,
             gpu=gpu,
             max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
             cancel_on_timeout=cancel_on_timeout,
         )
 
@@ -506,6 +523,9 @@ class AsyncSandbox:
         namespace: str | None = _defaults.NAMESPACE,
         gpu: GpuRequest | None = None,
         max_pending_secs: int | None = None,
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "AsyncSandbox":
         """Return the one sandbox bound to ``name``. Create it on first use.
 
@@ -572,6 +592,8 @@ class AsyncSandbox:
                         allow_out=allow_out,
                         deny_out=deny_out,
                         snapshot_id=snapshot_id,
+                        allow_unauthenticated_access=allow_unauthenticated_access,
+                        exposed_ports=exposed_ports,
                         proxy_url=proxy_url,
                         request_timeout=request_timeout,
                         name=name,
@@ -583,6 +605,7 @@ class AsyncSandbox:
                         namespace=namespace,
                         gpu=gpu,
                         max_pending_secs=max_pending_secs,
+                        auto_resume=auto_resume,
                     )
                 except RemoteAPIError as e:
                     if e.status_code != 409:
@@ -905,7 +928,13 @@ class AsyncSandbox:
         return self._cached_info
 
     async def info(self) -> SandboxInfo:
-        return await self._fetch_info()
+        """Fetch current sandbox information, including changes made by other clients."""
+        self._require_lifecycle_client("info")
+        self._cached_info = (
+            await self._lifecycle_client.get(self._lifecycle_identifier())
+        ).value
+        self._sandbox_id = self._cached_info.sandbox_id
+        return self._cached_info
 
     def _lifecycle_identifier(self) -> str:
         if self._sandbox_id is not None:
@@ -958,6 +987,7 @@ class AsyncSandbox:
         poll_interval: float = 1.0,
         allow_unauthenticated_access: bool | None = None,
         exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
         network: NetworkConfig | ClearNetworkPolicy | None = None,
     ) -> Traced[SandboxInfo]:
         """Update this sandbox's properties.
@@ -991,6 +1021,9 @@ class AsyncSandbox:
                 be positive. Ignored when wait is False.
             allow_unauthenticated_access: Whether exposed user ports should be
                 reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
             exposed_ports: User ports routable through the sandbox proxy.
                 Port 9501 is reserved for sandbox management.
             network: Egress network policy. Omit to leave it unchanged, pass a
@@ -1030,6 +1063,7 @@ class AsyncSandbox:
             name=name,
             allow_unauthenticated_access=allow_unauthenticated_access,
             exposed_ports=exposed_ports,
+            auto_resume=auto_resume,
             network=network,
         )
         self._sandbox_id = traced.sandbox_id
@@ -1198,7 +1232,18 @@ class AsyncSandbox:
         *,
         pid: int | str = _PROCESS_ARG_UNSET,
     ) -> Traced[None]:
-        """Kill a process by PID or process name given on creation."""
+        """Kill a process and everything it started.
+
+        The daemon tears the process down as one unit. An unmanaged process's
+        whole process group is SIGKILLed at once, including children that
+        detached with ``setsid``. For a managed process this stops the whole
+        supervisor (it will not be restarted) gracefully: SIGTERM to the
+        process group, then SIGKILL once the process's ``stop_grace_ms``
+        (default 10 s) has elapsed.
+
+        Args:
+            process: PID or process name given on creation.
+        """
         seg = _resolve_process_arg(process, pid)
         try:
             trace_id = await self._rust_client.kill_process_async(seg)
@@ -1229,7 +1274,17 @@ class AsyncSandbox:
         *,
         pid: int | str = _PROCESS_ARG_UNSET,
     ) -> Traced[SendSignalResponse]:
-        """Send a signal to a process by PID or process name given on creation."""
+        """Send a signal to a process and everything it started.
+
+        The signal is delivered to the process's whole process group, as a
+        terminal's job control would; SIGKILL also reaps children that
+        detached with ``setsid``. There is no escalation: a process that
+        ignores SIGTERM keeps running.
+
+        Args:
+            process: PID or process name given on creation.
+            signal: Signal number (e.g. 15 for SIGTERM, 9 for SIGKILL)
+        """
         seg = _resolve_process_arg(process, pid)
         if signal is _PROCESS_ARG_UNSET:
             raise TypeError("missing required argument: `signal`")

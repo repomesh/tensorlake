@@ -395,6 +395,10 @@ class Sandbox:
         max_pending_secs: int | None = None,
         cancel_on_timeout: bool = False,
         wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "Sandbox": ...
 
     @overload
@@ -429,6 +433,9 @@ class Sandbox:
         cancel_on_timeout: bool = False,
         *,
         wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> PendingSandbox: ...
 
     @classmethod
@@ -461,6 +468,10 @@ class Sandbox:
         max_pending_secs: int | None = None,
         cancel_on_timeout: bool = False,
         wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "Sandbox | PendingSandbox":
         """Create a new sandbox and return a connected, running handle.
 
@@ -528,6 +539,8 @@ class Sandbox:
             organization_id: Organization ID for multi-tenant access.
             project_id: Project ID for scoping resources.
             namespace: Namespace for local-server deployments.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
             max_pending_secs: Longest the sandbox may wait for capacity
                 before the server fails it with reason ``no_capacity``.
                 Unset (the default) waits indefinitely; 30 minutes or more
@@ -540,6 +553,16 @@ class Sandbox:
             wait: ``True`` (default) blocks until running; ``False``
                 returns a :class:`PendingSandbox` at once. Cannot be
                 combined with ``pool_id``.
+            allow_unauthenticated_access: Allow proxy access without
+                authentication when True; require authentication when False.
+                None uses server defaults or inherits the snapshot setting.
+                Cannot be combined with ``pool_id`` because pool claims
+                inherit access settings from the pool.
+            exposed_ports: User ports to expose through the sandbox proxy.
+                Integers from 1 to 65535, excluding reserved port 9501;
+                duplicates are removed and ports sorted. None uses server
+                defaults or inherits the snapshot setting; [] exposes no
+                user ports. Cannot be combined with ``pool_id``.
 
         Returns:
             Connected Sandbox handle (auto-terminates in context manager),
@@ -550,6 +573,7 @@ class Sandbox:
                 pending; it keeps its place in the queue.
             SandboxError: If the sandbox fails to start; ``reason`` carries
                 the server's reason (``no_capacity``, ``cancelled``, ...).
+                Also raised when access overrides are combined with ``pool_id``.
         """
         from .client import SandboxClient
 
@@ -590,10 +614,13 @@ class Sandbox:
                 allow_out=allow_out,
                 deny_out=deny_out,
                 snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
                 name=name,
                 file_systems=file_systems,
                 gpu=gpu,
                 max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
                 proxy_url=proxy_url,
                 request_timeout=effective_request_timeout,
                 owns_sandbox=True,
@@ -612,12 +639,15 @@ class Sandbox:
             deny_out=deny_out,
             pool_id=pool_id,
             snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
             proxy_url=proxy_url,
             request_timeout=effective_request_timeout,
             name=name,
             file_systems=file_systems,
             gpu=gpu,
             max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
             cancel_on_timeout=cancel_on_timeout,
         )
 
@@ -704,6 +734,9 @@ class Sandbox:
         namespace: str | None = _defaults.NAMESPACE,
         gpu: GpuRequest | None = None,
         max_pending_secs: int | None = None,
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
     ) -> "Sandbox":
         """Return the one sandbox bound to ``name``. Create it on first use.
 
@@ -824,6 +857,8 @@ class Sandbox:
                         allow_out=allow_out,
                         deny_out=deny_out,
                         snapshot_id=snapshot_id,
+                        allow_unauthenticated_access=allow_unauthenticated_access,
+                        exposed_ports=exposed_ports,
                         proxy_url=proxy_url,
                         request_timeout=request_timeout,
                         name=name,
@@ -835,6 +870,7 @@ class Sandbox:
                         namespace=namespace,
                         gpu=gpu,
                         max_pending_secs=max_pending_secs,
+                        auto_resume=auto_resume,
                     )
                 except RemoteAPIError as e:
                     if e.status_code != 409:
@@ -1339,7 +1375,12 @@ class Sandbox:
         Raises:
             SandboxError: If no lifecycle client is available.
         """
-        return self._fetch_info()
+        self._require_lifecycle_client("info")
+        self._cached_info = self._lifecycle_client.get(
+            self._lifecycle_identifier()
+        ).value
+        self._sandbox_id = self._cached_info.sandbox_id
+        return self._cached_info
 
     def _lifecycle_identifier(self) -> str:
         """Best-effort stable identifier for lifecycle API calls.
@@ -1409,6 +1450,7 @@ class Sandbox:
         poll_interval: float = 1.0,
         allow_unauthenticated_access: bool | None = None,
         exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
         network: NetworkConfig | ClearNetworkPolicy | None = None,
     ) -> Traced[SandboxInfo]:
         """Update this sandbox's properties.
@@ -1442,6 +1484,9 @@ class Sandbox:
                 be positive. Ignored when wait is False.
             allow_unauthenticated_access: Whether exposed user ports should be
                 reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
             exposed_ports: User ports routable through the sandbox proxy.
                 Port 9501 is reserved for sandbox management.
             network: Egress network policy. Omit to leave it unchanged, pass a
@@ -1481,6 +1526,7 @@ class Sandbox:
             name=name,
             allow_unauthenticated_access=allow_unauthenticated_access,
             exposed_ports=exposed_ports,
+            auto_resume=auto_resume,
             network=network,
         )
         self._sandbox_id = traced.sandbox_id
@@ -1720,7 +1766,9 @@ class Sandbox:
             args: Command arguments
             env: Environment variables
             working_dir: Working directory
-            timeout: Maximum seconds to wait (enforced server-side; None = no limit)
+            timeout: Maximum seconds to wait (enforced server-side; None = no limit).
+                When it expires the daemon SIGKILLs the command's whole process
+                tree, not only the first process.
             user: Process user. Defaults to ``None``, which runs as the image's
                 configured user (the image ``USER`` directive, falling back to
                 root). Pass a username such as ``"root"``, a Docker-style id
@@ -1857,11 +1905,17 @@ class Sandbox:
         *,
         pid: int | str = _PROCESS_ARG_UNSET,
     ) -> Traced[None]:
-        """Kill a process.
+        """Kill a process and everything it started.
+
+        The daemon tears the process down as one unit. An unmanaged process's
+        whole process group is SIGKILLed at once, including children that
+        detached with ``setsid``. For a managed process this stops the whole
+        supervisor (it will not be restarted) gracefully: SIGTERM to the
+        process group, then SIGKILL once the process's ``stop_grace_ms``
+        (default 10 s) has elapsed.
 
         Args:
-            process: PID or process name given on creation. For a managed process this stops
-                the whole supervisor (it will not be restarted).
+            process: PID or process name given on creation.
         """
         seg = _resolve_process_arg(process, pid)
         try:
@@ -1895,7 +1949,12 @@ class Sandbox:
         *,
         pid: int | str = _PROCESS_ARG_UNSET,
     ) -> Traced[SendSignalResponse]:
-        """Send a signal to a process.
+        """Send a signal to a process and everything it started.
+
+        The signal is delivered to the process's whole process group, as a
+        terminal's job control would; SIGKILL also reaps children that
+        detached with ``setsid``. There is no escalation: a process that
+        ignores SIGTERM keeps running.
 
         Args:
             process: PID or process name given on creation.

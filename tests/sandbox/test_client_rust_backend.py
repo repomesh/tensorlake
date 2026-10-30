@@ -1,5 +1,6 @@
 import json
 import unittest
+from functools import partial
 from unittest.mock import patch
 
 from tensorlake.sandbox import (
@@ -9,6 +10,7 @@ from tensorlake.sandbox import (
     NetworkConfig,
     PendingSandbox,
     PoolInUseError,
+    Sandbox,
     SandboxInfo,
     SandboxNotFoundError,
     SandboxNotRoutableError,
@@ -104,6 +106,14 @@ class _FakeRustClient:
 
     def resume_sandbox(self, sandbox_id):
         self.resume_calls.append(sandbox_id)
+
+    def suspend_sandbox_and_wait(self, *, sandbox_id, wait_sec):
+        self.suspend_calls.append(sandbox_id)
+        return "trace-suspend", True
+
+    def resume_sandbox_and_wait(self, *, sandbox_id, wait_sec):
+        self.resume_calls.append(sandbox_id)
+        return "trace-resume", True
 
     def connect_proxy(
         self, *, proxy_url, sandbox_id, routing_hint=None, request_timeout_sec=None
@@ -1219,6 +1229,126 @@ class TestSandboxClientRustBackend(unittest.TestCase):
         self.assertEqual(request_json["resources"]["cpus"], 2.0)
         self.assertEqual(request_json["resources"]["memory_mb"], 1024)
 
+    def test_creation_access_settings_reach_rust(self):
+        class RunningClient(_FakeRustClient):
+            def create_sandbox(self, request_json):
+                self.create_request_json = request_json
+                return (
+                    "trace-create",
+                    '{"sandbox_id":"sbx-1","status":"running",'
+                    '"sandbox_url":"https://sbx-1.example.test"}',
+                )
+
+        fake = RunningClient()
+        with (
+            patch("tensorlake.sandbox.client._RUST_SANDBOX_CLIENT_AVAILABLE", True),
+            patch(
+                "tensorlake.sandbox.client.RustCloudSandboxClient", return_value=fake
+            ),
+        ):
+            client = SandboxClient(api_key="k", api_url="http://localhost:8900")
+            create_calls = (
+                client.create,
+                partial(client.create, wait=False),
+                client.create_and_connect,
+                partial(Sandbox.create, api_key="k", api_url="http://localhost:8900"),
+                partial(
+                    Sandbox.create,
+                    api_key="k",
+                    api_url="http://localhost:8900",
+                    wait=False,
+                ),
+            )
+            access_cases = (
+                (
+                    {
+                        "allow_unauthenticated_access": True,
+                        "exposed_ports": [8080, 1, 3000, 8080, 65535],
+                    },
+                    {
+                        "allow_unauthenticated_access": True,
+                        "exposed_ports": [1, 3000, 8080, 65535],
+                    },
+                ),
+                (
+                    {"allow_unauthenticated_access": False, "exposed_ports": []},
+                    {"allow_unauthenticated_access": False, "exposed_ports": []},
+                ),
+                (
+                    {"allow_unauthenticated_access": False},
+                    {"allow_unauthenticated_access": False},
+                ),
+                ({"exposed_ports": []}, {"exposed_ports": []}),
+                ({}, {}),
+                ({"allow_unauthenticated_access": None, "exposed_ports": None}, {}),
+            )
+            for create in create_calls:
+                for snapshot_id in (None, "snap-1"):
+                    for options, expected in access_cases:
+                        with self.subTest(
+                            create=create, snapshot_id=snapshot_id, options=options
+                        ):
+                            original = json.dumps(options)
+                            fake.create_request_json = None
+                            create(snapshot_id=snapshot_id, **options)
+                            request = json.loads(fake.create_request_json)
+                            actual = {
+                                field: request[field]
+                                for field in (
+                                    "allow_unauthenticated_access",
+                                    "exposed_ports",
+                                )
+                                if field in request
+                            }
+                            self.assertEqual(actual, expected)
+                            self.assertEqual(json.dumps(options), original)
+
+    def test_create_rejects_invalid_exposed_ports_before_sending(self):
+        fake = _FakeRustClient()
+        with (
+            patch("tensorlake.sandbox.client._RUST_SANDBOX_CLIENT_AVAILABLE", True),
+            patch(
+                "tensorlake.sandbox.client.RustCloudSandboxClient", return_value=fake
+            ),
+        ):
+            client = SandboxClient(api_key="k", api_url="http://localhost:8900")
+            for wait in (True, False):
+                for port in (0, -1, 65536, 9501, True, False, 8080.5, "8080"):
+                    with self.subTest(wait=wait, port=port):
+                        with self.assertRaises(SandboxError):
+                            client.create(wait=wait, exposed_ports=[port])
+            self.assertFalse(fake.create_request_json)
+
+    def test_pool_creation_rejects_access_overrides_before_claiming(self):
+        fake = _FakeRustClient()
+        with (
+            patch("tensorlake.sandbox.client._RUST_SANDBOX_CLIENT_AVAILABLE", True),
+            patch(
+                "tensorlake.sandbox.client.RustCloudSandboxClient", return_value=fake
+            ),
+            patch.object(SandboxClient, "claim") as claim,
+        ):
+            client = SandboxClient(api_key="k", api_url="http://localhost:8900")
+            for create in (
+                client.create_and_connect,
+                partial(Sandbox.create, api_key="k", api_url="http://localhost:8900"),
+            ):
+                for options in (
+                    {"allow_unauthenticated_access": False},
+                    {"allow_unauthenticated_access": True},
+                    {"exposed_ports": []},
+                    {"exposed_ports": [3000]},
+                    {"allow_unauthenticated_access": False, "exposed_ports": []},
+                ):
+                    with self.subTest(create=create, options=options):
+                        with self.assertRaisesRegex(
+                            SandboxError, "cannot be combined with pool_id"
+                        ):
+                            create(pool_id="pool-1", **options)
+            claim.assert_not_called()
+            self.assertFalse(fake.create_request_json)
+            self.assertEqual(fake.connect_proxy_calls, [])
+
     def test_create_snapshot_restore_inherits_resources_when_omitted(self):
         fake = _FakeRustClient()
         client = SandboxClient(api_url="http://localhost:8900", api_key="k")
@@ -1659,6 +1789,51 @@ class TestSandboxClientRustBackend(unittest.TestCase):
         self.assertEqual(fake.resume_calls, ["my-env"])
         self.assertEqual(fake.suspend_calls, [])
 
+    def test_suspend_and_resume_wait_on_the_server(self):
+        client = SandboxClient(api_url="http://localhost:8900", api_key="k")
+        fake = _FakeRustClient()
+        # The server's answer settles the wait; nothing polls.
+        fake.get_sandbox_json = lambda *args, **kwargs: self.fail("polled")
+        client._rust_client = fake
+
+        self.assertEqual(client.suspend("my-env").trace_id, "trace-suspend")
+        self.assertEqual(client.resume("my-env").trace_id, "trace-resume")
+
+        self.assertEqual(fake.suspend_calls, ["my-env"])
+        self.assertEqual(fake.resume_calls, ["my-env"])
+
+    def test_suspend_polls_when_the_server_wait_runs_out(self):
+        class _PendingRustClient(_FakeRustClient):
+            def __init__(self):
+                super().__init__()
+                self.statuses = ["suspending", "suspended"]
+                self.wait_secs = []
+
+            def suspend_sandbox_and_wait(self, *, sandbox_id, wait_sec):
+                self.wait_secs.append(wait_sec)
+                return "trace-suspend", False
+
+            def get_sandbox_json(self, sandbox_id):
+                return (
+                    "trace-get-sandbox",
+                    json.dumps(
+                        {
+                            **json.loads(_sandbox_info_json(sandbox_id)),
+                            "status": self.statuses.pop(0),
+                        }
+                    ),
+                )
+
+        client = SandboxClient(api_url="http://localhost:8900", api_key="k")
+        fake = _PendingRustClient()
+        client._rust_client = fake
+
+        result = client.suspend("my-env", timeout=2.0, poll_interval=0.01)
+
+        self.assertEqual(result.trace_id, "trace-suspend")
+        self.assertEqual(fake.wait_secs, [2.0])
+        self.assertEqual(fake.statuses, [])
+
     def test_handle_resume_wait_rebinds_proxy_from_fresh_info(self):
         class _ResumeRoutingRustClient(_FakeRustClient):
             def __init__(self):
@@ -1820,7 +1995,7 @@ class TestSandboxClientRustBackend(unittest.TestCase):
             def close(self):
                 return None
 
-            def suspend_sandbox(self, sandbox_id):
+            def suspend_sandbox_and_wait(self, *, sandbox_id, wait_sec):
                 raise FakeRustError(
                     ("remote_api", 404, f"sandbox {sandbox_id} not found")
                 )
@@ -1846,7 +2021,7 @@ class TestSandboxClientRustBackend(unittest.TestCase):
             def close(self):
                 return None
 
-            def resume_sandbox(self, sandbox_id):
+            def resume_sandbox_and_wait(self, *, sandbox_id, wait_sec):
                 raise FakeRustError(
                     ("remote_api", 404, f"sandbox {sandbox_id} not found")
                 )
