@@ -1,6 +1,6 @@
 {
   "name": "@tensorlakeai/tensorlake",
-  "version": "0.5.160",
+  "version": "0.5.162",
   "description": "TensorLake SDK for applications, sandboxes, and cloud services",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -82,14 +82,15 @@
     "@eslint/js": "^9.39.4",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.1",
     "eslint": "^9.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.8.0",
     "typescript-eslint": "^8.65.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.1.12"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.13.0",
+    "@grpc/grpc-js": "^1.14.5",
     "@grpc/proto-loader": "^0.8.0",
     "ajv": "^8.17.1",
     "fflate": "^0.8.2",
@@ -98,11 +99,15 @@
     "ws": "^8.20.0"
   },
   "optionalDependencies": {
-    "@tensorlakeai/native-darwin-arm64": "0.5.160",
-    "@tensorlakeai/native-linux-arm64-gnu": "0.5.160",
-    "@tensorlakeai/native-linux-arm64-musl": "0.5.160",
-    "@tensorlakeai/native-linux-x64-gnu": "0.5.160",
-    "@tensorlakeai/native-linux-x64-musl": "0.5.160",
-    "@tensorlakeai/native-win32-x64": "0.5.160"
+    "@tensorlakeai/native-darwin-arm64": "0.5.162",
+    "@tensorlakeai/native-linux-arm64-gnu": "0.5.162",
+    "@tensorlakeai/native-linux-arm64-musl": "0.5.162",
+    "@tensorlakeai/native-linux-x64-gnu": "0.5.162",
+    "@tensorlakeai/native-linux-x64-musl": "0.5.162",
+    "@tensorlakeai/native-win32-x64": "0.5.162"
+  },
+  "overrides": {
+    "minimatch@>=7 <11.0.1": "^11.0.1",
+    "esbuild@>=0.27.3 <0.28.1": "^0.28.1"
   }
 }
